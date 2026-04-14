@@ -1,17 +1,13 @@
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
-from launch_ros.substitutions import FindPackageShare
+from ament_index_python.packages import get_package_share_directory
+import os
 
 
 def generate_launch_description() -> LaunchDescription:
-    default_params = PathJoinSubstitution([
-        FindPackageShare('core'),
-        'config',
-        'core.params.yaml',
-    ])
-
+    default_params = os.path.join(get_package_share_directory('core'), 'config', 'core.params.yaml')
     return LaunchDescription([
         DeclareLaunchArgument('namespace', default_value='core'),
         DeclareLaunchArgument('params_file', default_value=default_params),
