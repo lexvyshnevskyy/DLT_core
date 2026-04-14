@@ -1,0 +1,26 @@
+core:
+  ros__parameters:
+    ads_topic: /ads1256
+    measure_topic: /measure_device
+    ltm_measurement_topic: /ltm2985/measurement
+    hmi_commands_topic: /hmi/commands
+    database_service: /database/query
+    sync_queue_size: 10
+    sync_slop: 0.5
+    enable_database_client: true
+    enable_pwm_controller: false
+    enable_temperature_control: false
+    control_period_sec: 1.0
+    control_channel: 9
+    monitor_channel: 3
+    target_temperature_c: 100.0
+    pid_k: 100.0
+    pid_ti: 3000.0
+    pid_td: 5.0
+    pid_sample_time_model: 100.0
+    profile_ramp_seconds_per_degree: 6.0
+    profile_hold_seconds: 86400.0
+    pwm_pin: 18
+    pwm_frequency: 100
+    pwm_range: 1000
+    status_topic: /core/temperature_control_status

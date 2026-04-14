@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""Threaded PWM helper using pigpio."""
+"""Simple pigpio-backed PWM helper for Raspberry Pi outputs."""
 
 from __future__ import annotations
 
-import threading
-import time
 from typing import Optional
 
 try:
@@ -14,14 +12,12 @@ except ImportError:  # pragma: no cover - environment specific
 
 
 class PwmController:
-    def __init__(self, pwm_pin: int = 18, frequency: int = 100, pwm_range: int = 1000, update_period: float = 0.01):
-        self.range = pwm_range
-        self.frequency = frequency
-        self.pwm_pin = pwm_pin
-        self.duty_cycle = 200
-        self.update_period = update_period
-        self._thread: Optional[threading.Thread] = None
-        self._running = False
+    def __init__(self, pwm_pin: int = 18, frequency: int = 100, pwm_range: int = 1000):
+        self.range = int(pwm_range)
+        self.frequency = int(frequency)
+        self.pwm_pin = int(pwm_pin)
+        self.duty_cycle = 0
+        self.pi: Optional["pigpio.pi"] = None
 
         if pigpio is None:
             raise RuntimeError('pigpio Python module is not installed')
@@ -32,22 +28,16 @@ class PwmController:
 
         self.pi.set_PWM_frequency(self.pwm_pin, self.frequency)
         self.pi.set_PWM_range(self.pwm_pin, self.range)
-
-        self._running = True
-        self._thread = threading.Thread(target=self._duty_cycle_loop, daemon=True)
-        self._thread.start()
-
-    def _duty_cycle_loop(self) -> None:
-        while self._running:
-            self.pi.set_PWM_dutycycle(self.pwm_pin, self.duty_cycle)
-            time.sleep(self.update_period)
+        self.pi.set_PWM_dutycycle(self.pwm_pin, 0)
 
     def set_duty_cycle(self, duty_cycle: int = 0) -> None:
-        self.duty_cycle = max(0, min(int(duty_cycle), self.range))
+        duty_cycle = max(0, min(int(duty_cycle), self.range))
+        self.duty_cycle = duty_cycle
+        if self.pi is not None:
+            self.pi.set_PWM_dutycycle(self.pwm_pin, duty_cycle)
 
     def stop(self) -> None:
-        self.pi.set_PWM_dutycycle(self.pwm_pin, 0)
-        self._running = False
-        if self._thread is not None:
-            self._thread.join(timeout=1.0)
-        self.pi.stop()
+        if self.pi is not None:
+            self.pi.set_PWM_dutycycle(self.pwm_pin, 0)
+            self.pi.stop()
+            self.pi = None
