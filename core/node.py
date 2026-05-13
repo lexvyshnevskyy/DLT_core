@@ -7,8 +7,7 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
 
-from core.srv import Query
-from database.srv import Query as DatabaseQuery
+from database.srv import Query
 from msgs.msg import Measurement
 
 from .classes.core_controller import CoreController
@@ -58,7 +57,7 @@ class CoreNode(Node):
         )
 
         if self.enable_database_client:
-            self.db_client = self.create_client(DatabaseQuery, self.database_service)
+            self.db_client = self.create_client(Query, self.database_service)
             if self.db_client.wait_for_service(timeout_sec=2.0):
                 self.get_logger().info(f'Database service available: {self.database_service}')
             else:
