@@ -7,6 +7,7 @@
     enable_pwm_controller: false
 
     pwm_pin: 18
+    pwm_pin_ch2: 19
     pwm_frequency_hz: 10
     pwm_range: 1000
 

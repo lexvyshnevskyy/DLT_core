@@ -24,6 +24,7 @@ class CoreNode(Node):
         self.declare_parameter('enable_database_client', True)
         self.declare_parameter('enable_pwm_controller', False)
         self.declare_parameter('pwm_pin', 18)
+        self.declare_parameter('pwm_pin_ch2', 19)
         self.declare_parameter('pwm_frequency_hz', 10)
         self.declare_parameter('pwm_range', 1000)
         self.declare_parameter('control_channel', 9)
