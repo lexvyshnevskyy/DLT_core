@@ -71,6 +71,7 @@ class CoreNode(Node):
             try:
                 self.controller = CoreController(
                     pwm_pin=int(self.get_parameter('pwm_pin').value),
+                    pwm_pin_ch2=int(self.get_parameter('pwm_pin_ch2').value),
                     pwm_frequency_hz=int(self.get_parameter('pwm_frequency_hz').value),
                     pwm_range=int(self.get_parameter('pwm_range').value),
                 )
