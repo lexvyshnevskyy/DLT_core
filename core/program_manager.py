@@ -32,12 +32,14 @@ class ProgramExperimentManager:
         configure_temperature: TcConfigureFn,
         log: LogFn,
         database_ready: Callable[[], bool],
+        database_error: Callable[[], str],
         temperature_enabled: Callable[[], bool],
     ) -> None:
         self._db_query = db_query
         self._configure_temperature = configure_temperature
         self._log = log
         self._database_ready = database_ready
+        self._database_error = database_error
         self._temperature_enabled = temperature_enabled
         self._lock = threading.RLock()
         self._state = ExperimentState()
@@ -53,7 +55,7 @@ class ProgramExperimentManager:
 
     def start(self, program_id: int) -> Dict[str, Any]:
         if not self._database_ready():
-            return {'result': 'False', 'error': 'database service unavailable'}
+            return {'result': 'False', 'error': self._database_error()}
         if not self._temperature_enabled():
             return {
                 'result': 'False',

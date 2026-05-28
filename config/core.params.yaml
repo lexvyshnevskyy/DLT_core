@@ -4,7 +4,7 @@
     hmi_commands_topic: /hmi/commands
     database_service: /database/query
     experiment_status_topic: experiment/status
-    enable_database_client: false
+    enable_database_client: true
     enable_program_scheduler: true
     enable_pwm_controller: false
     database_query_timeout_sec: 15.0

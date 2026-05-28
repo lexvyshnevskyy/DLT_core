@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import queue
+import threading
 import time
 from typing import Any, Dict, Optional
 
 import rclpy
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from std_msgs.msg import String
 
@@ -76,6 +80,13 @@ class CoreNode(Node):
         self.temperature_control: Optional[TemperatureControlWorker] = None
         self.program_manager: Optional[ProgramExperimentManager] = None
         self._last_status_publish_monotonic: float = 0.0
+        self._measurement_db_queue: queue.Queue = queue.Queue(maxsize=500)
+        self._measurement_db_stop = threading.Event()
+        self._measurement_db_thread: Optional[threading.Thread] = None
+        # Core service callbacks call the database client while handling /core/query.
+        # Use a reentrant group so the database client response can be processed
+        # while the program-start callback waits for it.
+        self._service_cb_group = ReentrantCallbackGroup()
 
         self.hmi_publisher = self.create_publisher(String, self.hmi_commands_topic, 10)
         self.experiment_status_publisher = self.create_publisher(
@@ -83,7 +94,12 @@ class CoreNode(Node):
             self.experiment_status_topic,
             10,
         )
-        self.service = self.create_service(Query, 'query', self.handle_query)
+        self.service = self.create_service(
+            Query,
+            'query',
+            self.handle_query,
+            callback_group=self._service_cb_group,
+        )
         self.measurement_subscription = self.create_subscription(
             Measurement,
             self.measurement_topic,
@@ -98,7 +114,11 @@ class CoreNode(Node):
         )
 
         if self.enable_database_client:
-            self.db_client = self.create_client(Query, self.database_service)
+            self.db_client = self.create_client(
+                Query,
+                self.database_service,
+                callback_group=self._service_cb_group,
+            )
             if self.db_client.wait_for_service(timeout_sec=2.0):
                 self.get_logger().info(f'Database service available: {self.database_service}')
             else:
@@ -143,13 +163,21 @@ class CoreNode(Node):
                 db_query=self._db_query,
                 configure_temperature=self._apply_temperature_control,
                 log=lambda msg: self.get_logger().info(msg),
-                database_ready=lambda: bool(self.db_client and self.db_client.service_is_ready()),
+                database_ready=self._database_service_ready,
+                database_error=self._database_unavailable_reason,
                 temperature_enabled=lambda: self.temperature_control is not None,
             )
             self.get_logger().info(
                 'Program experiment scheduler enabled (measurement-driven, no fixed 1 Hz timer).'
             )
-        elif self.enable_program_scheduler:
+        if self.enable_measurement_logging and self.enable_database_client:
+            self._measurement_db_thread = threading.Thread(
+                target=self._measurement_db_worker,
+                name='core-measurement-db',
+                daemon=True,
+            )
+            self._measurement_db_thread.start()
+        if self.enable_program_scheduler and not self.enable_pwm_controller:
             self.get_logger().warn(
                 'enable_program_scheduler is true but PWM/temperature control is disabled.'
             )
@@ -239,10 +267,21 @@ class CoreNode(Node):
             e720_max_age_sec=self.measurement_log_e720_max_age_sec,
         )
         try:
-            if not insert_measurement_immediate(self._db_query, row):
-                self.get_logger().warning('measurement_insert returned failure')
-        except Exception as exc:
-            self.get_logger().error(f'measurement_insert failed: {exc}')
+            self._measurement_db_queue.put_nowait(row)
+        except queue.Full:
+            self.get_logger().warning('measurement DB queue full — sample dropped')
+
+    def _measurement_db_worker(self) -> None:
+        while not self._measurement_db_stop.is_set():
+            try:
+                row = self._measurement_db_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                if not insert_measurement_immediate(self._db_query, row):
+                    self.get_logger().warning('measurement_insert returned failure')
+            except Exception as exc:
+                self.get_logger().error(f'measurement_insert failed: {exc}')
 
     def _publish_experiment_status(self, *, force: bool = False) -> None:
         if self.program_manager is None and self.temperature_control is None:
@@ -342,6 +381,27 @@ class CoreNode(Node):
             return {'result': 'Ok', 'program': self.program_manager.status()}
         return {'result': 'False', 'error': f'Unknown program command: {cmd}'}
 
+    def _database_service_ready(self) -> bool:
+        if not self.enable_database_client or self.db_client is None:
+            return False
+        try:
+            if self.db_client.service_is_ready():
+                return True
+            return bool(self.db_client.wait_for_service(timeout_sec=5.0))
+        except Exception:
+            return False
+
+    def _database_unavailable_reason(self) -> str:
+        if not self.enable_database_client or self.db_client is None:
+            return (
+                'Core database client is disabled. Set DELATOMETRY_CORE_ENABLE_DATABASE_CLIENT=true '
+                'in /etc/default/delatometry and restart delatometry-core.service.'
+            )
+        return (
+            f'Database service not available at {self.database_service}. '
+            'Ensure delatometry-database.service is running.'
+        )
+
     def _db_query(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         if self.db_client is None:
             raise RuntimeError('Database client is disabled')
@@ -351,10 +411,24 @@ class CoreNode(Node):
         request = Query.Request()
         request.query = json.dumps(payload)
         future = self.db_client.call_async(request)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=self.database_query_timeout_sec)
+
+        # rclpy Future.result() must not be used with timeout=.  Polling also
+        # avoids deadlock when this method is called from a service callback: the
+        # MultiThreadedExecutor can complete the database client response on a
+        # different worker in the reentrant callback group.
+        deadline = time.monotonic() + max(0.1, float(self.database_query_timeout_sec))
+        while not future.done() and time.monotonic() < deadline:
+            time.sleep(0.005)
         if not future.done():
+            try:
+                future.cancel()
+            except Exception:
+                pass
             raise TimeoutError(f'Timeout waiting for {self.database_service}')
-        response = future.result()
+        try:
+            response = future.result()
+        except Exception as exc:
+            raise RuntimeError(f'Database query failed: {exc}') from exc
         if response is None:
             raise RuntimeError('Database query failed')
         return json.loads(response.response or '{}')
@@ -433,6 +507,9 @@ class CoreNode(Node):
         return result
 
     def shutdown(self) -> None:
+        self._measurement_db_stop.set()
+        if self._measurement_db_thread is not None:
+            self._measurement_db_thread.join(timeout=2.0)
         if self.program_manager is not None and self.program_manager.is_running():
             try:
                 self.program_manager.stop_all()
@@ -447,12 +524,15 @@ class CoreNode(Node):
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = CoreNode()
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
         node.shutdown()
+        executor.shutdown()
         node.destroy_node()
         rclpy.shutdown()
 
