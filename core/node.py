@@ -283,6 +283,11 @@ class CoreNode(Node):
             except Exception as exc:
                 self.get_logger().error(f'measurement_insert failed: {exc}')
 
+    def _pwm_snapshot(self) -> Optional[Dict[str, Any]]:
+        if self.controller is None:
+            return None
+        return self.controller.snapshot()
+
     def _publish_experiment_status(self, *, force: bool = False) -> None:
         if self.program_manager is None and self.temperature_control is None:
             return
@@ -300,6 +305,7 @@ class CoreNode(Node):
             'temperature_control': (
                 self.temperature_control.get_snapshot() if self.temperature_control else None
             ),
+            'pwm': self._pwm_snapshot(),
             'timestamp': time.time(),
         }
         msg = String()
@@ -323,6 +329,7 @@ class CoreNode(Node):
             'measurements': self._measurement_snapshot(),
             'database_service_ready': bool(self.db_client and self.db_client.service_is_ready()),
             'temperature_control': self.temperature_control.get_snapshot() if self.temperature_control else None,
+            'pwm': self._pwm_snapshot(),
         }
 
         program_cmd = query.get('program')
