@@ -3,8 +3,11 @@
     measurement_topic: ltm2985/measurement
     hmi_commands_topic: /hmi/commands
     database_service: /database/query
+    experiment_status_topic: experiment/status
     enable_database_client: false
+    enable_program_scheduler: true
     enable_pwm_controller: false
+    database_query_timeout_sec: 15.0
 
     pwm_pin: 18
     pwm_pin_ch2: 19
@@ -13,8 +16,13 @@
 
     control_channel: 9
     monitor_channel: 3
+    measure_topic: /measure_device
     target_k: 373.15
     control_period_sec: 1.0
+    control_watchdog_period_sec: 0.25
+    experiment_status_publish_period_sec: 0.25
+    enable_measurement_logging: true
+    measurement_log_e720_max_age_sec: 1.0
     measurement_timeout_sec: 5.0
 
     kp: 25.0

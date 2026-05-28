@@ -108,7 +108,9 @@ class TemperatureControlWorker:
         monitor_channel: int = 3,
         target_k: float = 373.15,
         control_period_sec: float = 1.0,
+        control_watchdog_period_sec: float = 0.25,
         measurement_timeout_sec: float = 5.0,
+        event_driven: bool = True,
         kp: float = 25.0,
         ki: float = 0.08,
         deadband_k: float = 0.3,
@@ -117,8 +119,10 @@ class TemperatureControlWorker:
         output_max: int = 1000,
     ) -> None:
         self._set_output = set_output_callback
-        self._control_period_sec = float(control_period_sec)
+        self._control_period_sec = max(0.01, float(control_period_sec))
+        self._control_watchdog_period_sec = max(0.05, float(control_watchdog_period_sec))
         self._measurement_timeout_sec = float(measurement_timeout_sec)
+        self._event_driven = bool(event_driven)
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -164,12 +168,22 @@ class TemperatureControlWorker:
             raw_type=str(raw_type),
             raw_value=float(raw_value),
         )
+        run_control = False
         with self._lock:
             self._measurements[state.channel] = state
             if state.channel == self.snapshot.control_channel:
                 self.snapshot.latest_control_temp_k = state.value_k
             if state.channel == self.snapshot.monitor_channel:
                 self.snapshot.latest_monitor_temp_k = state.value_k
+            if (
+                self._event_driven
+                and self._enabled
+                and state.valid
+                and state.channel == self.snapshot.control_channel
+            ):
+                run_control = True
+        if run_control:
+            self.run_control_step(time.monotonic())
 
     def configure(
         self,
@@ -242,61 +256,84 @@ class TemperatureControlWorker:
         with self._lock:
             return self.snapshot.to_dict()
 
+    def run_control_step(self, now: Optional[float] = None) -> None:
+        """Run PI once (called on each fresh control-channel temperature sample)."""
+        if now is None:
+            now = time.monotonic()
+        with self._lock:
+            if not self._enabled:
+                return
+            control_channel = self.snapshot.control_channel
+            target_k = self.snapshot.target_k
+            control_state = self._measurements.get(control_channel)
+            monitor_state = self._measurements.get(self.snapshot.monitor_channel)
+
+        if monitor_state is not None:
+            with self._lock:
+                self.snapshot.latest_monitor_temp_k = monitor_state.value_k
+
+        measurement_fresh = (
+            control_state is not None
+            and control_state.valid
+            and (now - control_state.stamp_monotonic) <= self._measurement_timeout_sec
+        )
+        if not measurement_fresh:
+            self._handle_stale_measurement()
+            return
+
+        dt = max(1e-3, now - self._last_update_monotonic)
+        self._last_update_monotonic = now
+        assert control_state is not None
+        heater_output, error_k = self.controller.update(
+            target_k=target_k,
+            measured_k=control_state.value_k,
+            dt=dt,
+        )
+        self._set_output(heater_output)
+        with self._lock:
+            self.snapshot.latest_control_temp_k = control_state.value_k
+            self.snapshot.measurement_fresh = True
+            self.snapshot.heater_output = heater_output
+            self.snapshot.error_k = error_k
+            self.snapshot.integral_term = self.controller.integral
+            self.snapshot.reason = 'controlling'
+
+    def _handle_stale_measurement(self) -> None:
+        self.controller.reset()
+        self._set_output(0)
+        with self._lock:
+            self.snapshot.measurement_fresh = False
+            self.snapshot.heater_output = 0
+            self.snapshot.error_k = None
+            self.snapshot.integral_term = self.controller.integral
+            self.snapshot.reason = 'waiting_for_fresh_measurement'
+
     def _run(self) -> None:
+        """Watchdog: disable heater if control samples stop (event-driven mode)."""
         while not self._stop_event.is_set():
             cycle_start = time.monotonic()
             with self._lock:
                 enabled = self._enabled
                 control_channel = self.snapshot.control_channel
-                monitor_channel = self.snapshot.monitor_channel
-                target_k = self.snapshot.target_k
                 control_state = self._measurements.get(control_channel)
-                monitor_state = self._measurements.get(monitor_channel)
 
-            if not enabled:
-                self._sleep_until_next_cycle(cycle_start)
-                continue
+            if enabled and control_state is not None:
+                now = time.monotonic()
+                fresh = (
+                    control_state.valid
+                    and (now - control_state.stamp_monotonic) <= self._measurement_timeout_sec
+                )
+                if not fresh:
+                    self._handle_stale_measurement()
 
-            now = time.monotonic()
-            dt = max(1e-3, now - self._last_update_monotonic)
-            self._last_update_monotonic = now
+            if not self._event_driven and enabled:
+                self.run_control_step(time.monotonic())
 
-            measurement_fresh = (
-                control_state is not None
-                and control_state.valid
-                and (now - control_state.stamp_monotonic) <= self._measurement_timeout_sec
-            )
-
-            if monitor_state is not None:
-                with self._lock:
-                    self.snapshot.latest_monitor_temp_k = monitor_state.value_k
-
-            if not measurement_fresh:
-                self.controller.reset()
-                self._set_output(0)
-                with self._lock:
-                    self.snapshot.measurement_fresh = False
-                    self.snapshot.heater_output = 0
-                    self.snapshot.error_k = None
-                    self.snapshot.integral_term = self.controller.integral
-                    self.snapshot.reason = 'waiting_for_fresh_measurement'
-                self._sleep_until_next_cycle(cycle_start)
-                continue
-
-            assert control_state is not None
-            heater_output, error_k = self.controller.update(target_k=target_k, measured_k=control_state.value_k, dt=dt)
-            self._set_output(heater_output)
-            with self._lock:
-                self.snapshot.latest_control_temp_k = control_state.value_k
-                self.snapshot.measurement_fresh = True
-                self.snapshot.heater_output = heater_output
-                self.snapshot.error_k = error_k
-                self.snapshot.integral_term = self.controller.integral
-                self.snapshot.reason = 'controlling'
-            self._sleep_until_next_cycle(cycle_start)
-
-    def _sleep_until_next_cycle(self, cycle_start: float) -> None:
-        elapsed = time.monotonic() - cycle_start
-        remaining = self._control_period_sec - elapsed
-        if remaining > 0.0:
-            self._stop_event.wait(timeout=remaining)
+            elapsed = time.monotonic() - cycle_start
+            wait = (
+                self._control_watchdog_period_sec
+                if self._event_driven
+                else self._control_period_sec
+            ) - elapsed
+            if wait > 0.0:
+                self._stop_event.wait(timeout=wait)
