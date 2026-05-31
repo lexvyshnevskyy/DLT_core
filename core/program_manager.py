@@ -125,6 +125,13 @@ class ProgramExperimentManager:
                 pid = int(program_id)
                 self._db_query({'cmd': 'program_update_status', 'id': pid, 'status': final_status})
                 self._finish_active_runs(pid, final_status)
+            elif self._database_ready():
+                reconciled = self._reconcile_db_stale_running(final_status)
+                if reconciled:
+                    self._log(
+                        f'Reconciled {reconciled} stale Running program(s) in DB → {final_status}'
+                    )
+            self._zero_heaters()
             self._halt_temperature_control()
             return {'result': 'Ok', 'program': state_to_public_dict(self._state)}
 
@@ -209,24 +216,37 @@ class ProgramExperimentManager:
             return []
         return ProgramScheduler.parse_steps(response.get('row', []))
 
-    def _mark_other_programs_stopped(self, except_program_id: int) -> None:
+    def _reconcile_db_stale_running(
+        self,
+        final_status: str,
+        *,
+        except_program_id: Optional[int] = None,
+    ) -> int:
+        """Finish DB programs/runs still marked Running while core is idle."""
+        reconciled = 0
         try:
             response = self._db_query({'cmd': 'program_all_list'})
             if response.get('result') != 'Ok':
-                return
+                return 0
             for raw_row in response.get('row', []):
                 parts = str(raw_row).split('^')
                 if len(parts) < 3:
                     continue
                 pid = int(parts[0])
-                status = str(parts[2] or '').strip().lower()
-                if pid == except_program_id:
+                if except_program_id is not None and pid == int(except_program_id):
                     continue
-                if status == 'running':
-                    self._db_query({'cmd': 'program_update_status', 'id': pid, 'status': 'Stopped'})
-                    self._finish_active_runs(pid, 'Stopped')
+                status = str(parts[2] or '').strip().lower()
+                if status != 'running':
+                    continue
+                self._db_query({'cmd': 'program_update_status', 'id': pid, 'status': final_status})
+                self._finish_active_runs(pid, final_status)
+                reconciled += 1
         except Exception as exc:
-            self._log(f'Failed to stop other running programs: {exc}')
+            self._log(f'Failed to reconcile stale Running programs in DB: {exc}')
+        return reconciled
+
+    def _mark_other_programs_stopped(self, except_program_id: int) -> None:
+        self._reconcile_db_stale_running('Stopped', except_program_id=except_program_id)
 
     def _finish_active_runs(self, program_id: int, status: str) -> None:
         try:
