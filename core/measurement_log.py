@@ -34,6 +34,7 @@ def build_measurement_row(
     target_k: Optional[float],
     *,
     run_id: Optional[int] = None,
+    elapsed_s: Optional[float] = None,
     e720_updated_monotonic: float = 0.0,
     e720_max_age_sec: float = 1.0,
 ) -> Dict[str, Any]:
@@ -53,6 +54,8 @@ def build_measurement_row(
     }
     if run_id is not None and int(run_id) > 0:
         row['run_id'] = int(run_id)
+    if elapsed_s is not None:
+        row['elapsed_s'] = max(0.0, float(elapsed_s))
     return row
 
 

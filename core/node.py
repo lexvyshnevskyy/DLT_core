@@ -326,6 +326,7 @@ class CoreNode(Node):
             float(monitor_msg.value) if monitor_msg is not None else 0.0,
             target_k,
             run_id=int(run_id),
+            elapsed_s=self.program_manager.elapsed_s(),
             e720_updated_monotonic=self._latest_e720_monotonic,
             e720_max_age_sec=self.measurement_log_e720_max_age_sec,
         )

@@ -42,6 +42,19 @@ def format_duration_hms(seconds: float) -> str:
     return f'{minutes}:{secs:02d}'
 
 
+def program_elapsed_s(state: ExperimentState) -> float:
+    """Elapsed experiment time from completed steps + current step (core scheduler clock)."""
+    if state.program_id is None or not state.steps:
+        return 0.0
+    completed_s = sum(
+        max(0.0, float(s.minutes) * 60.0) for s in state.steps[: max(0, state.step_index)]
+    )
+    step_elapsed_s = 0.0
+    if state.step_started_monotonic is not None:
+        step_elapsed_s = max(0.0, time.monotonic() - float(state.step_started_monotonic))
+    return completed_s + step_elapsed_s
+
+
 def experiment_timing(state: ExperimentState) -> Dict[str, Any]:
     if state.program_id is None or not state.steps:
         return {
@@ -56,13 +69,7 @@ def experiment_timing(state: ExperimentState) -> Dict[str, Any]:
         }
 
     total_s = total_program_duration_s(state.steps)
-    completed_s = sum(
-        max(0.0, float(s.minutes) * 60.0) for s in state.steps[: max(0, state.step_index)]
-    )
-    step_elapsed_s = 0.0
-    if state.step_started_monotonic is not None:
-        step_elapsed_s = max(0.0, time.monotonic() - float(state.step_started_monotonic))
-    elapsed_s = completed_s + step_elapsed_s
+    elapsed_s = program_elapsed_s(state)
     remaining_s = max(0.0, total_s - elapsed_s)
     progress = (elapsed_s / total_s * 100.0) if total_s > 0 else 0.0
 

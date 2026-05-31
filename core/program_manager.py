@@ -9,6 +9,7 @@ from .program_experiment import (
     ExperimentState,
     ProgramScheduler,
     ProgramStep,
+    program_elapsed_s,
     state_to_public_dict,
     total_program_duration_s,
 )
@@ -55,6 +56,11 @@ class ProgramExperimentManager:
     def status(self) -> Dict[str, Any]:
         with self._lock:
             return state_to_public_dict(self._state)
+
+    def elapsed_s(self) -> float:
+        """Scheduler elapsed time — same clock as UI timing and measurement rows."""
+        with self._lock:
+            return program_elapsed_s(self._state)
 
     def start(self, program_id: int) -> Dict[str, Any]:
         with self._lock:
