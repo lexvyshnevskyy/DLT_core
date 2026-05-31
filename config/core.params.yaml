@@ -3,6 +3,7 @@
     measurement_topic: ltm2985/measurement
     hmi_commands_topic: /hmi/commands
     database_service: /database/query
+    # With run_node.sh __ns:=/core this is /core/experiment/status (matches webui subscriber).
     experiment_status_topic: experiment/status
     enable_database_client: true
     enable_program_scheduler: true

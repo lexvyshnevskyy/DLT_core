@@ -123,7 +123,15 @@ class ProgramExperimentManager:
         if not steps:
             return {'result': 'False', 'error': f'Program {program_id_int} has no steps'}
 
-        self._stop_locked(program_id=None, final_status='Stopped')
+        with self._lock:
+            active_id = self._state.program_id
+            if active_id is not None:
+                if int(active_id) == program_id_int:
+                    return {
+                        'result': 'False',
+                        'error': f'Program {program_id_int} is already running in core',
+                    }
+                self._stop_locked(program_id=None, final_status='Stopped')
 
         run_id = 0
         try:

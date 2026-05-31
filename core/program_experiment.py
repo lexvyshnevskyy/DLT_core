@@ -135,9 +135,12 @@ class ProgramScheduler:
                     'program_id': state.program_id,
                     'target_k': target_k,
                 }
+            next_step = state.steps[state.step_index]
             return {
                 'active': True,
                 'program_id': state.program_id,
+                'target_k': float(next_step.t_start),
+                'reset_integral': True,
                 'advanced_step': True,
                 'step_index': state.step_index,
                 'step_count': len(state.steps),

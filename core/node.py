@@ -95,6 +95,7 @@ class CoreNode(Node):
         self._measurement_db_queue: queue.Queue = queue.Queue(maxsize=500)
         self._measurement_db_stop = threading.Event()
         self._measurement_db_thread: Optional[threading.Thread] = None
+        self._throttle_log_times: Dict[str, float] = {}
         # Core service callbacks call the database client while handling /core/query.
         # Use a reentrant group so the database client response can be processed
         # while the program-start callback waits for it.
@@ -293,6 +294,13 @@ class CoreNode(Node):
             self._log_measurement_sample_if_running()
             self._publish_experiment_status(force=False)
 
+    def _log_throttled(self, key: str, message: str, period_sec: float = 5.0) -> None:
+        now = time.monotonic()
+        if now - self._throttle_log_times.get(key, 0.0) < period_sec:
+            return
+        self._throttle_log_times[key] = now
+        self.get_logger().warning(message)
+
     def _log_measurement_sample_if_running(self) -> None:
         if not self.enable_measurement_logging or self.program_manager is None:
             return
@@ -311,6 +319,11 @@ class CoreNode(Node):
         monitor_msg = self.latest_measurements.get(self.monitor_channel)
         if control_msg is None or not bool(control_msg.valid):
             return
+        if monitor_msg is None or not bool(monitor_msg.valid):
+            self._log_throttled(
+                'measurement_monitor',
+                f'Monitor channel {self.monitor_channel} missing or invalid — logging t_ch2=0',
+            )
 
         target_k = status.get('last_target_k')
         if self.temperature_control is not None:
@@ -587,10 +600,25 @@ class CoreNode(Node):
                 result[field] = value
         return result
 
+    def _drain_measurement_db_queue(self, timeout_sec: float = 5.0) -> None:
+        deadline = time.monotonic() + max(0.5, float(timeout_sec))
+        while time.monotonic() < deadline:
+            try:
+                row = self._measurement_db_queue.get_nowait()
+            except queue.Empty:
+                time.sleep(0.02)
+                continue
+            try:
+                if not insert_measurement_immediate(self._db_query, row):
+                    self.get_logger().warning('measurement_insert returned failure during drain')
+            except Exception as exc:
+                self.get_logger().error(f'measurement_insert failed during drain: {exc}')
+
     def shutdown(self) -> None:
         self._measurement_db_stop.set()
+        self._drain_measurement_db_queue()
         if self._measurement_db_thread is not None:
-            self._measurement_db_thread.join(timeout=2.0)
+            self._measurement_db_thread.join(timeout=5.0)
         if self.program_manager is not None and self.program_manager.is_running():
             try:
                 self.program_manager.stop_all()
