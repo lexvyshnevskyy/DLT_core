@@ -57,6 +57,10 @@ class ProgramExperimentManager:
             return state_to_public_dict(self._state)
 
     def start(self, program_id: int) -> Dict[str, Any]:
+        with self._lock:
+            return self._start_locked(int(program_id))
+
+    def _start_locked(self, program_id_int: int) -> Dict[str, Any]:
         if not self._database_ready():
             return {'result': 'False', 'error': self._database_error()}
         if not self._temperature_enabled():
@@ -64,12 +68,11 @@ class ProgramExperimentManager:
                 'result': 'False',
                 'error': 'Temperature control not enabled (enable_pwm_controller:=true)',
             }
-        program_id_int = int(program_id)
         steps = self._load_steps(program_id_int)
         if not steps:
             return {'result': 'False', 'error': f'Program {program_id_int} has no steps'}
 
-        self.stop(program_id=None, final_status='Stopped')
+        self._stop_locked(program_id=None, final_status='Stopped')
 
         run_resp = self._db_query({'cmd': 'program_run_start', 'program_id': program_id_int})
         if run_resp.get('result') != 'Ok':
@@ -85,18 +88,17 @@ class ProgramExperimentManager:
 
         now = time.monotonic()
         first_target_k = float(steps[0].t_start)
-        with self._lock:
-            self._state = ExperimentState(
-                program_id=program_id_int,
-                run_id=run_id,
-                run_index=run_index,
-                steps=steps,
-                step_index=0,
-                step_started_monotonic=None,
-                started_monotonic=now,
-                status='Running',
-                last_target_k=first_target_k,
-            )
+        self._state = ExperimentState(
+            program_id=program_id_int,
+            run_id=run_id,
+            run_index=run_index,
+            steps=steps,
+            step_index=0,
+            step_started_monotonic=None,
+            started_monotonic=now,
+            status='Running',
+            last_target_k=first_target_k,
+        )
 
         self._apply_target(first_target_k, reset_integral=True)
         total_min = total_program_duration_s(steps) / 60.0
@@ -104,12 +106,19 @@ class ProgramExperimentManager:
             f'Core started program {program_id_int} run {run_id} '
             f'({len(steps)} steps, ~{total_min:.1f} min)'
         )
-        return {'result': 'Ok', 'program': self.status()}
+        return {'result': 'Ok', 'program': state_to_public_dict(self._state)}
 
     def stop(self, program_id: Optional[int] = None, final_status: str = 'Stopped') -> Dict[str, Any]:
         with self._lock:
-            active_id = self._state.program_id
-            run_id = self._state.run_id
+            return self._stop_locked(program_id, final_status)
+
+    def _stop_locked(
+        self,
+        program_id: Optional[int],
+        final_status: str,
+    ) -> Dict[str, Any]:
+        active_id = self._state.program_id
+        run_id = self._state.run_id
 
         if active_id is None:
             if program_id is not None and self._database_ready():
@@ -117,7 +126,7 @@ class ProgramExperimentManager:
                 self._db_query({'cmd': 'program_update_status', 'id': pid, 'status': final_status})
                 self._finish_active_runs(pid, final_status)
             self._halt_temperature_control()
-            return {'result': 'Ok', 'program': self.status()}
+            return {'result': 'Ok', 'program': state_to_public_dict(self._state)}
 
         if program_id is not None and int(program_id) != int(active_id):
             return {
@@ -126,36 +135,37 @@ class ProgramExperimentManager:
             }
 
         self._finish_program(run_id, int(active_id), final_status)
-        return {'result': 'Ok', 'program': self.status()}
+        return {'result': 'Ok', 'program': state_to_public_dict(self._state)}
 
     def stop_all(self) -> Dict[str, Any]:
-        return self.stop(program_id=None, final_status='Stopped')
+        with self._lock:
+            return self._stop_locked(program_id=None, final_status='Stopped')
 
     def tick(self) -> None:
         with self._lock:
             if self._state.program_id is None:
                 return
-            state = self._state
-            action = self._scheduler.tick(state)
+            action = self._scheduler.tick(self._state)
 
-        if not action.get('active'):
-            if action.get('finished'):
-                pid = int(action.get('program_id', state.program_id or 0))
-                rid = int(state.run_id or 0)
-                self._finish_program(rid, pid, 'Finished')
-            return
+            if not action.get('active'):
+                if action.get('finished'):
+                    pid = int(action.get('program_id', self._state.program_id or 0))
+                    rid = int(self._state.run_id or 0)
+                    self._finish_program(rid, pid, 'Finished')
+                return
 
-        target_k = action.get('target_k')
-        if target_k is None:
-            return
-        reset = bool(action.get('step_started') or action.get('reset_integral'))
-        self._apply_target(float(target_k), reset_integral=reset)
-        if action.get('step_started') or action.get('advanced_step'):
-            step = int(action.get('step_index', 0)) + 1
-            total = int(action.get('step_count', 0))
-            self._log(
-                f'Program {state.program_id}: step {step}/{total}, target {float(target_k):.2f} K'
-            )
+            target_k = action.get('target_k')
+            if target_k is None:
+                return
+            reset = bool(action.get('step_started') or action.get('reset_integral'))
+            self._apply_target(float(target_k), reset_integral=reset)
+            if action.get('step_started') or action.get('advanced_step'):
+                step = int(action.get('step_index', 0)) + 1
+                total = int(action.get('step_count', 0))
+                self._log(
+                    f'Program {self._state.program_id}: step {step}/{total}, '
+                    f'target {float(target_k):.2f} K'
+                )
 
     def _finish_program(self, run_id: int, program_id: int, final_status: str) -> None:
         self._zero_heaters()
