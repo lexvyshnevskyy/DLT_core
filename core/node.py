@@ -408,15 +408,23 @@ class CoreNode(Node):
 
         pwm = query.get('pwm')
         if pwm is not None:
-            result['pwm'] = self._apply_pwm(pwm)
+            if self.program_manager is not None and self.program_manager.is_running():
+                result['pwm'] = self._pwm_snapshot()
+                result['program_scheduler_note'] = (
+                    'Manual pwm ignored while program is running in core.'
+                )
+            else:
+                result['pwm'] = self._apply_pwm(pwm)
 
         temperature_control = query.get('temperature_control')
         if temperature_control is not None:
             if self.program_manager is not None and self.program_manager.is_running():
                 result['temperature_control'] = self.temperature_control.get_snapshot()
-                result['program_scheduler_note'] = (
-                    'Manual temperature_control ignored while program is running in core.'
-                )
+                note = 'Manual temperature_control ignored while program is running in core.'
+                if 'program_scheduler_note' in result:
+                    result['program_scheduler_note'] += f' {note}'
+                else:
+                    result['program_scheduler_note'] = note
             else:
                 result['temperature_control'] = self._apply_temperature_control(temperature_control)
 
