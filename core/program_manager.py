@@ -60,19 +60,43 @@ class ProgramExperimentManager:
         with self._lock:
             return self._start_locked(int(program_id))
 
+    def _db_cmd_ok(self, response: Dict[str, Any], context: str) -> bool:
+        if response.get('result') == 'Ok':
+            return True
+        err = str(response.get('error', '') or 'failed')
+        self._log(f'{context}: {err}')
+        return False
+
+    def _update_program_status(self, program_id: int, status: str) -> bool:
+        return self._db_cmd_ok(
+            self._db_query({
+                'cmd': 'program_update_status',
+                'id': int(program_id),
+                'status': status,
+            }),
+            f'program_update_status({program_id}→{status})',
+        )
+
+    def _finish_program_run(self, run_id: int, status: str) -> bool:
+        if run_id <= 0:
+            return True
+        return self._db_cmd_ok(
+            self._db_query({
+                'cmd': 'program_run_finish',
+                'run_id': int(run_id),
+                'status': status,
+            }),
+            f'program_run_finish(run={run_id}→{status})',
+        )
+
     def _abort_failed_start(self, program_id: int, run_id: int, reason: str) -> None:
         """Roll back DB + core state when start fails after program_run_start."""
         self._zero_heaters()
         self._halt_temperature_control()
         if self._database_ready():
             try:
-                if run_id > 0:
-                    self._db_query({
-                        'cmd': 'program_run_finish',
-                        'run_id': run_id,
-                        'status': 'Failed',
-                    })
-                self._db_query({'cmd': 'program_update_status', 'id': program_id, 'status': 'Stopped'})
+                self._finish_program_run(run_id, 'Failed')
+                self._update_program_status(program_id, 'Stopped')
                 self._finish_active_runs(program_id, 'Failed')
             except Exception as exc:
                 self._log(f'Failed to roll back aborted start for program {program_id}: {exc}')
@@ -106,13 +130,8 @@ class ProgramExperimentManager:
             if run_id <= 0:
                 raise RuntimeError('program_run_start returned no run_id')
 
-            status_resp = self._db_query({
-                'cmd': 'program_update_status',
-                'id': program_id_int,
-                'status': 'Running',
-            })
-            if status_resp.get('result') != 'Ok':
-                raise RuntimeError(status_resp.get('error', 'program_update_status failed'))
+            if not self._update_program_status(program_id_int, 'Running'):
+                raise RuntimeError('program_update_status failed (program not marked Running in DB)')
 
             self._mark_other_programs_stopped(program_id_int)
 
@@ -157,8 +176,10 @@ class ProgramExperimentManager:
         if active_id is None:
             if program_id is not None and self._database_ready():
                 pid = int(program_id)
-                self._db_query({'cmd': 'program_update_status', 'id': pid, 'status': final_status})
+                updated = self._update_program_status(pid, final_status)
                 self._finish_active_runs(pid, final_status)
+                if not updated:
+                    self._update_program_status(pid, final_status)
             elif self._database_ready():
                 reconciled = self._reconcile_db_stale_running(final_status)
                 if reconciled:
@@ -213,39 +234,16 @@ class ProgramExperimentManager:
         if not self._database_ready():
             return False
 
-        def _try_finish() -> bool:
-            ok = True
-            if run_id > 0:
-                run_resp = self._db_query({
-                    'cmd': 'program_run_finish',
-                    'run_id': run_id,
-                    'status': final_status,
-                })
-                if run_resp.get('result') != 'Ok':
-                    ok = False
-            prog_resp = self._db_query({
-                'cmd': 'program_update_status',
-                'id': program_id,
-                'status': final_status,
-            })
-            if prog_resp.get('result') != 'Ok':
-                ok = False
-            return ok
-
-        if _try_finish():
+        run_ok = self._finish_program_run(run_id, final_status)
+        prog_ok = self._update_program_status(program_id, final_status)
+        if run_ok and prog_ok:
             return True
 
         try:
             self._finish_active_runs(program_id, final_status)
-            self._db_query({'cmd': 'program_update_status', 'id': program_id, 'status': final_status})
-            if run_id > 0:
-                run_resp = self._db_query({
-                    'cmd': 'program_run_finish',
-                    'run_id': run_id,
-                    'status': final_status,
-                })
-                return run_resp.get('result') == 'Ok'
-            return True
+            prog_ok = self._update_program_status(program_id, final_status)
+            run_ok = self._finish_program_run(run_id, final_status)
+            return prog_ok and run_ok
         except Exception as exc:
             self._log(f'Program {program_id} finish fallback failed: {exc}')
             return False
@@ -261,8 +259,12 @@ class ProgramExperimentManager:
                 f'(target status {final_status}) — forcing DB reconcile'
             )
             try:
-                self._db_query({'cmd': 'program_update_status', 'id': program_id, 'status': final_status})
                 self._finish_active_runs(program_id, final_status)
+                if not self._update_program_status(program_id, final_status):
+                    self._log(
+                        f'CRITICAL: program_update_status still failed for program {program_id} '
+                        f'after finish_active_runs'
+                    )
             except Exception as exc:
                 self._log(f'CRITICAL: DB reconcile after finish failed for program {program_id}: {exc}')
 
@@ -331,9 +333,9 @@ class ProgramExperimentManager:
                 status = str(parts[2] or '').strip().lower()
                 if status != 'running':
                     continue
-                self._db_query({'cmd': 'program_update_status', 'id': pid, 'status': final_status})
-                self._finish_active_runs(pid, final_status)
-                reconciled += 1
+                if self._update_program_status(pid, final_status):
+                    self._finish_active_runs(pid, final_status)
+                    reconciled += 1
         except Exception as exc:
             self._log(f'Failed to reconcile stale Running programs in DB: {exc}')
         return reconciled
