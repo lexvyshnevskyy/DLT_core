@@ -47,6 +47,8 @@ class CoreNode(Node):
         self.declare_parameter('enable_measurement_logging', True)
         self.declare_parameter('measurement_log_e720_max_age_sec', 1.0)
         self.declare_parameter('measurement_timeout_sec', 5.0)
+        self.declare_parameter('program_ltm_control_timeout_sec', 5.0)
+        self.declare_parameter('program_ltm_watchdog_period_sec', 0.5)
         self.declare_parameter('database_query_timeout_sec', 15.0)
         self.declare_parameter('kp', 25.0)
         self.declare_parameter('ki', 0.08)
@@ -69,8 +71,18 @@ class CoreNode(Node):
         )
         self.enable_measurement_logging = bool(self.get_parameter('enable_measurement_logging').value)
         self.measurement_log_e720_max_age_sec = float(self.get_parameter('measurement_log_e720_max_age_sec').value)
+        self.program_ltm_control_timeout_sec = max(
+            1.0,
+            float(self.get_parameter('program_ltm_control_timeout_sec').value),
+        )
+        self.program_ltm_watchdog_period_sec = max(
+            0.1,
+            float(self.get_parameter('program_ltm_watchdog_period_sec').value),
+        )
         self.control_channel = int(self.get_parameter('control_channel').value)
         self.monitor_channel = int(self.get_parameter('monitor_channel').value)
+        self._last_control_ltm_monotonic: float = 0.0
+        self._ltm_fail_in_progress = False
 
         self.latest_measurements: Dict[int, Measurement] = {}
         self._latest_e720: Optional[E720] = None
@@ -166,9 +178,16 @@ class CoreNode(Node):
                 database_ready=self._database_service_ready,
                 database_error=self._database_unavailable_reason,
                 temperature_enabled=lambda: self.temperature_control is not None,
+                zero_heaters=self._zero_all_heaters,
+            )
+            self._program_ltm_watchdog_timer = self.create_timer(
+                self.program_ltm_watchdog_period_sec,
+                self._program_ltm_watchdog_tick,
             )
             self.get_logger().info(
-                'Program experiment scheduler enabled (measurement-driven, no fixed 1 Hz timer).'
+                'Program experiment scheduler enabled (measurement-driven). '
+                f'LTM control ch {self.control_channel} timeout '
+                f'{self.program_ltm_control_timeout_sec:.1f}s → FAIL.'
             )
         if self.enable_measurement_logging and self.enable_database_client:
             self._measurement_db_thread = threading.Thread(
@@ -197,6 +216,47 @@ class CoreNode(Node):
     def _is_temperature_msg(msg: Measurement) -> bool:
         return str(msg.type) in ('temperature_K', 'temperature_C')
 
+    def _reset_program_ltm_watchdog(self) -> None:
+        self._last_control_ltm_monotonic = time.monotonic()
+
+    def _zero_all_heaters(self) -> None:
+        if self.controller is not None:
+            try:
+                self.controller.set_heater_output(0)
+            except Exception as exc:
+                self.get_logger().error(f'Failed to set heater PWM to 0: {exc}')
+        if self.temperature_control is not None:
+            try:
+                self.temperature_control.configure(enabled=False)
+            except Exception as exc:
+                self.get_logger().error(f'Failed to disable temperature control: {exc}')
+
+    def _fail_program_ltm_timeout(self) -> None:
+        self.get_logger().error(
+            f'No valid LTM sample on control channel {self.control_channel} for '
+            f'{self.program_ltm_control_timeout_sec:.1f}s — stopping experiment as FAIL'
+        )
+        self._zero_all_heaters()
+        if self.program_manager is not None and self.program_manager.is_running():
+            self.program_manager.stop(program_id=None, final_status='FAIL')
+        self._publish_experiment_status(force=True)
+
+    def _program_ltm_watchdog_tick(self) -> None:
+        if self.program_manager is None or not self.program_manager.is_running():
+            return
+        if self._ltm_fail_in_progress:
+            return
+        last = self._last_control_ltm_monotonic
+        if last <= 0.0:
+            return
+        if (time.monotonic() - last) <= self.program_ltm_control_timeout_sec:
+            return
+        self._ltm_fail_in_progress = True
+        try:
+            self._fail_program_ltm_timeout()
+        finally:
+            self._ltm_fail_in_progress = False
+
     def measurement_callback(self, msg: Measurement) -> None:
         self.latest_measurements[int(msg.channel)] = msg
         if not self._is_temperature_msg(msg):
@@ -205,10 +265,13 @@ class CoreNode(Node):
         channel = int(msg.channel)
         is_control = channel == self.control_channel
 
+        if is_control and bool(msg.valid):
+            self._last_control_ltm_monotonic = time.monotonic()
+
         if is_control and self.program_manager is not None:
             try:
                 was_running = self.program_manager.is_running()
-                if was_running:
+                if was_running and bool(msg.valid):
                     self.program_manager.tick()
                 if was_running and not self.program_manager.is_running():
                     self._publish_experiment_status(force=True)
@@ -372,6 +435,8 @@ class CoreNode(Node):
         if cmd == 'start':
             program_id = int(program_cmd.get('program_id', 0))
             out = self.program_manager.start(program_id)
+            if str(out.get('result', '')).lower() in ('ok', 'true'):
+                self._reset_program_ltm_watchdog()
             self._publish_experiment_status(force=True)
             return out
         if cmd == 'stop':

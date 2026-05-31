@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 DbQueryFn = Callable[[Dict[str, Any]], Dict[str, Any]]
 TcConfigureFn = Callable[[Dict[str, Any]], Dict[str, Any]]
 LogFn = Callable[[str], None]
+ZeroHeatersFn = Callable[[], None]
 
 
 class ProgramExperimentManager:
@@ -34,6 +35,7 @@ class ProgramExperimentManager:
         database_ready: Callable[[], bool],
         database_error: Callable[[], str],
         temperature_enabled: Callable[[], bool],
+        zero_heaters: Optional[ZeroHeatersFn] = None,
     ) -> None:
         self._db_query = db_query
         self._configure_temperature = configure_temperature
@@ -41,6 +43,7 @@ class ProgramExperimentManager:
         self._database_ready = database_ready
         self._database_error = database_error
         self._temperature_enabled = temperature_enabled
+        self._zero_heaters = zero_heaters or (lambda: None)
         self._lock = threading.RLock()
         self._state = ExperimentState()
         self._scheduler = ProgramScheduler()
@@ -155,6 +158,7 @@ class ProgramExperimentManager:
             )
 
     def _finish_program(self, run_id: int, program_id: int, final_status: str) -> None:
+        self._zero_heaters()
         self._halt_temperature_control()
         if self._database_ready() and run_id > 0:
             try:
