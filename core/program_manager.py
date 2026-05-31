@@ -208,22 +208,69 @@ class ProgramExperimentManager:
                     f'target {float(target_k):.2f} K'
                 )
 
-    def _finish_program(self, run_id: int, program_id: int, final_status: str) -> None:
-        self._zero_heaters()
-        self._halt_temperature_control()
-        if self._database_ready() and run_id > 0:
-            try:
-                self._db_query({
+    def _persist_program_finish(self, run_id: int, program_id: int, final_status: str) -> bool:
+        """Write run + program final status to DB; return True if persistence succeeded."""
+        if not self._database_ready():
+            return False
+
+        def _try_finish() -> bool:
+            ok = True
+            if run_id > 0:
+                run_resp = self._db_query({
                     'cmd': 'program_run_finish',
                     'run_id': run_id,
                     'status': final_status,
                 })
+                if run_resp.get('result') != 'Ok':
+                    ok = False
+            prog_resp = self._db_query({
+                'cmd': 'program_update_status',
+                'id': program_id,
+                'status': final_status,
+            })
+            if prog_resp.get('result') != 'Ok':
+                ok = False
+            return ok
+
+        if _try_finish():
+            return True
+
+        try:
+            self._finish_active_runs(program_id, final_status)
+            self._db_query({'cmd': 'program_update_status', 'id': program_id, 'status': final_status})
+            if run_id > 0:
+                run_resp = self._db_query({
+                    'cmd': 'program_run_finish',
+                    'run_id': run_id,
+                    'status': final_status,
+                })
+                return run_resp.get('result') == 'Ok'
+            return True
+        except Exception as exc:
+            self._log(f'Program {program_id} finish fallback failed: {exc}')
+            return False
+
+    def _finish_program(self, run_id: int, program_id: int, final_status: str) -> None:
+        self._zero_heaters()
+        self._halt_temperature_control()
+
+        db_ok = self._persist_program_finish(run_id, program_id, final_status)
+        if not db_ok:
+            self._log(
+                f'CRITICAL: Program {program_id} run {run_id} ended in core but DB finish failed '
+                f'(target status {final_status}) — forcing DB reconcile'
+            )
+            try:
                 self._db_query({'cmd': 'program_update_status', 'id': program_id, 'status': final_status})
+                self._finish_active_runs(program_id, final_status)
             except Exception as exc:
-                self._log(f'Failed to update program status: {exc}')
-        with self._lock:
-            self._state = ExperimentState()
-        self._log(f'Program {program_id} ended: {final_status}')
+                self._log(f'CRITICAL: DB reconcile after finish failed for program {program_id}: {exc}')
+
+        self._state = ExperimentState()
+        self._log(
+            f'Program {program_id} ended: {final_status}'
+            + ('' if db_ok else ' (DB sync required — check program_runs)')
+        )
 
     def _apply_target(
         self,
