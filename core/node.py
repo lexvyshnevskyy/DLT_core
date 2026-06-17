@@ -174,7 +174,10 @@ class CoreNode(Node):
                     output_max=int(self.get_parameter('pwm_range').value),
                 )
                 self.temperature_control.start()
-                self.get_logger().info('PWM controller and threaded temperature control initialized.')
+                backend = self.controller.heater_pwm.backend
+                self.get_logger().info(
+                    f'PWM controller and threaded temperature control initialized (backend={backend}).'
+                )
             except Exception as exc:
                 self.controller = None
                 self.temperature_control = None
@@ -590,7 +593,7 @@ class CoreNode(Node):
     def _apply_pwm(self, pwm: Dict[str, Any]) -> Dict[str, Any]:
         if self.controller is None:
             raise RuntimeError(
-                'PWM controller is not enabled. Set parameter enable_pwm_controller:=true and ensure pigpio is available.'
+                'PWM controller is not enabled. Set parameter enable_pwm_controller:=true and ensure GPIO PWM is available (pigpiod on Pi 4, lgpio on Pi 5).'
             )
 
         heater = pwm.get('heater')
@@ -604,7 +607,7 @@ class CoreNode(Node):
     def _apply_temperature_control(self, config: Dict[str, Any]) -> Dict[str, Any]:
         if self.temperature_control is None:
             raise RuntimeError(
-                'Temperature control is not enabled. Set enable_pwm_controller:=true and ensure pigpio is available.'
+                'Temperature control is not enabled. Set enable_pwm_controller:=true and ensure GPIO PWM is available (pigpiod on Pi 4, lgpio on Pi 5).'
             )
 
         return self.temperature_control.configure(

@@ -42,6 +42,7 @@ class CoreController:
             'pwm_pin': self.heater_pwm.pwm_pin,
             'pwm_frequency_hz': self.heater_pwm.frequency,
             'pwm_range': self.heater_pwm.range,
+            'pwm_backend': self.heater_pwm.backend,
         }
         if self.heater_pwm_ch2 is not None:
             data['heater_pwm_ch2'] = self.heater_pwm_ch2.duty_cycle
