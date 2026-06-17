@@ -15,7 +15,7 @@ def e720_from_msg(msg: Any) -> Dict[str, Any]:
     if hasattr(msg, 'header') and hasattr(msg.header, 'frame_id'):
         frame_id = str(msg.header.frame_id)
 
-    online = frame_id != 'e720_offline'
+    online = not str(frame_id).endswith('_offline')
     return {
         'online': online,
         'frequency': float(field('frequency') or 0.0),

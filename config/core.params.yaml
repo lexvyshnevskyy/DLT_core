@@ -18,6 +18,7 @@
     control_channel: 9
     monitor_channel: 3
     measure_topic: /measure_device
+    measure_source: e720
     target_k: 373.15
     control_period_sec: 1.0
     control_watchdog_period_sec: 0.25

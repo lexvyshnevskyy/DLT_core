@@ -41,6 +41,7 @@ class CoreNode(Node):
         self.declare_parameter('monitor_channel', 3)
         self.declare_parameter('target_k', 373.15)
         self.declare_parameter('measure_topic', '/measure_device')
+        self.declare_parameter('measure_source', 'e720')
         self.declare_parameter('control_period_sec', 1.0)
         self.declare_parameter('control_watchdog_period_sec', 0.25)
         self.declare_parameter('experiment_status_publish_period_sec', 0.25)
@@ -56,6 +57,7 @@ class CoreNode(Node):
         self.declare_parameter('max_output_step', 60)
 
         self.measurement_topic = str(self.get_parameter('measurement_topic').value)
+        self.measure_source = str(self.get_parameter('measure_source').value).strip().lower() or 'e720'
         self.measure_topic = str(self.get_parameter('measure_topic').value)
         self.hmi_commands_topic = str(self.get_parameter('hmi_commands_topic').value)
         self.database_service = str(self.get_parameter('database_service').value)
