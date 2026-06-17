@@ -32,8 +32,11 @@ def resolve_measure_topics_from_env(env: Dict[str, str]) -> Dict[str, str]:
     )
     if not command_topic.startswith('/'):
         command_topic = f'/{command_topic}'
+    if not frequency_topic.startswith('/'):
+        frequency_topic = f'/{frequency_topic}'
     return {
         'source': source,
         'measure_topic': measure_topic,
         'measure_command_topic': command_topic,
+        'measure_frequency_topic': frequency_topic,
     }
