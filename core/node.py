@@ -19,6 +19,7 @@ from .classes.core_controller import CoreController
 from .classes.temperature_control import TemperatureControlWorker
 from .e720_util import e720_from_msg
 from .measurement_log import build_measurement_row, insert_measurement_immediate
+from .program_experiment import normalize_experiment_mode, uses_ltm_in_logs, uses_temperature_control, uses_timer_tick
 from .program_manager import ProgramExperimentManager
 
 
@@ -47,6 +48,7 @@ class CoreNode(Node):
         self.declare_parameter('experiment_status_publish_period_sec', 0.25)
         self.declare_parameter('enable_measurement_logging', True)
         self.declare_parameter('measurement_log_e720_max_age_sec', 1.0)
+        self.declare_parameter('measurement_log_interval_sec', 1.0)
         self.declare_parameter('measurement_timeout_sec', 5.0)
         self.declare_parameter('program_ltm_control_timeout_sec', 5.0)
         self.declare_parameter('program_ltm_watchdog_period_sec', 0.5)
@@ -73,6 +75,10 @@ class CoreNode(Node):
         )
         self.enable_measurement_logging = bool(self.get_parameter('enable_measurement_logging').value)
         self.measurement_log_e720_max_age_sec = float(self.get_parameter('measurement_log_e720_max_age_sec').value)
+        self.measurement_log_interval_sec = max(
+            0.1,
+            float(self.get_parameter('measurement_log_interval_sec').value),
+        )
         self.program_ltm_control_timeout_sec = max(
             1.0,
             float(self.get_parameter('program_ltm_control_timeout_sec').value),
@@ -84,6 +90,7 @@ class CoreNode(Node):
         self.control_channel = int(self.get_parameter('control_channel').value)
         self.monitor_channel = int(self.get_parameter('monitor_channel').value)
         self._last_control_ltm_monotonic: float = 0.0
+        self._last_measurement_log_monotonic: float = 0.0
         self._ltm_fail_in_progress = False
 
         self.latest_measurements: Dict[int, Measurement] = {}
@@ -173,7 +180,7 @@ class CoreNode(Node):
                 self.temperature_control = None
                 self.get_logger().error(f'Failed to initialize PWM controller: {exc}')
 
-        if self.enable_program_scheduler and self.enable_pwm_controller:
+        if self.enable_program_scheduler:
             self.program_manager = ProgramExperimentManager(
                 db_query=self._db_query,
                 configure_temperature=self._apply_temperature_control,
@@ -187,10 +194,18 @@ class CoreNode(Node):
                 self.program_ltm_watchdog_period_sec,
                 self._program_ltm_watchdog_tick,
             )
+            self._program_timer = self.create_timer(
+                self.measurement_log_interval_sec,
+                self._program_timer_tick,
+            )
             self.get_logger().info(
-                'Program experiment scheduler enabled (measurement-driven). '
+                'Program experiment scheduler enabled. '
                 f'LTM control ch {self.control_channel} timeout '
-                f'{self.program_ltm_control_timeout_sec:.1f}s → FAIL.'
+                f'{self.program_ltm_control_timeout_sec:.1f}s → FAIL (default mode only).'
+            )
+        elif self.enable_program_scheduler and not self._database_service_ready():
+            self.get_logger().warn(
+                'enable_program_scheduler is true but database service is not available.'
             )
         if self.enable_measurement_logging and self.enable_database_client:
             self._measurement_db_thread = threading.Thread(
@@ -199,9 +214,9 @@ class CoreNode(Node):
                 daemon=True,
             )
             self._measurement_db_thread.start()
-        if self.enable_program_scheduler and not self.enable_pwm_controller:
+        if self.enable_program_scheduler and self.enable_pwm_controller and self.program_manager is None:
             self.get_logger().warn(
-                'enable_program_scheduler is true but PWM/temperature control is disabled.'
+                'PWM is enabled but program scheduler failed to start (check database service).'
             )
 
         self.get_logger().info(
@@ -234,6 +249,35 @@ class CoreNode(Node):
             except Exception as exc:
                 self.get_logger().error(f'Failed to disable temperature control: {exc}')
 
+    def _current_experiment_mode(self) -> str:
+        if self.program_manager is None or not self.program_manager.is_running():
+            return 'default'
+        return normalize_experiment_mode(
+            str(self.program_manager.status().get('experiment_mode', 'default'))
+        )
+
+    def _program_timer_tick(self) -> None:
+        if self.program_manager is None or not self.program_manager.is_running():
+            return
+        mode = self._current_experiment_mode()
+        if not uses_timer_tick(mode):
+            return
+        try:
+            was_running = True
+            self.program_manager.tick()
+            if was_running and not self.program_manager.is_running():
+                self._publish_experiment_status(force=True)
+                return
+        except Exception as exc:
+            self.get_logger().error(f'Program scheduler tick failed: {exc}')
+            return
+
+        now = time.monotonic()
+        if now - self._last_measurement_log_monotonic >= self.measurement_log_interval_sec:
+            self._last_measurement_log_monotonic = now
+            self._log_measurement_sample_if_running()
+        self._publish_experiment_status(force=False)
+
     def _fail_program_ltm_timeout(self) -> None:
         self.get_logger().error(
             f'No valid LTM sample on control channel {self.control_channel} for '
@@ -246,6 +290,8 @@ class CoreNode(Node):
 
     def _program_ltm_watchdog_tick(self) -> None:
         if self.program_manager is None or not self.program_manager.is_running():
+            return
+        if not uses_temperature_control(self._current_experiment_mode()):
             return
         if self._ltm_fail_in_progress:
             return
@@ -267,11 +313,12 @@ class CoreNode(Node):
 
         channel = int(msg.channel)
         is_control = channel == self.control_channel
+        mode = self._current_experiment_mode()
 
         if is_control and bool(msg.valid):
             self._last_control_ltm_monotonic = time.monotonic()
 
-        if is_control and self.program_manager is not None:
+        if is_control and self.program_manager is not None and uses_temperature_control(mode):
             try:
                 was_running = self.program_manager.is_running()
                 if was_running and bool(msg.valid):
@@ -281,7 +328,7 @@ class CoreNode(Node):
             except Exception as exc:
                 self.get_logger().error(f'Program scheduler tick failed: {exc}')
 
-        if self.temperature_control is not None:
+        if self.temperature_control is not None and uses_temperature_control(mode):
             try:
                 self.temperature_control.update_measurement(
                     channel=channel,
@@ -292,7 +339,7 @@ class CoreNode(Node):
             except ValueError as exc:
                 self.get_logger().warning(str(exc))
 
-        if is_control and bool(msg.valid):
+        if is_control and bool(msg.valid) and uses_temperature_control(mode):
             self._log_measurement_sample_if_running()
             self._publish_experiment_status(force=False)
 
@@ -319,16 +366,25 @@ class CoreNode(Node):
 
         control_msg = self.latest_measurements.get(self.control_channel)
         monitor_msg = self.latest_measurements.get(self.monitor_channel)
-        if control_msg is None or not bool(control_msg.valid):
-            return
-        if monitor_msg is None or not bool(monitor_msg.valid):
-            self._log_throttled(
-                'measurement_monitor',
-                f'Monitor channel {self.monitor_channel} missing or invalid — logging t_ch2=0',
-            )
+        mode = self._current_experiment_mode()
+        include_ltm = uses_ltm_in_logs(mode)
+
+        if include_ltm:
+            if control_msg is None or not bool(control_msg.valid):
+                return
+            if monitor_msg is None or not bool(monitor_msg.valid):
+                self._log_throttled(
+                    'measurement_monitor',
+                    f'Monitor channel {self.monitor_channel} missing or invalid — logging t_ch2=0',
+                )
+            control_value = float(control_msg.value)
+            monitor_value = float(monitor_msg.value) if monitor_msg is not None else 0.0
+        else:
+            control_value = 0.0
+            monitor_value = 0.0
 
         target_k = status.get('last_target_k')
-        if self.temperature_control is not None:
+        if self.temperature_control is not None and uses_temperature_control(mode):
             tc = self.temperature_control.get_snapshot()
             if tc.get('target_k') is not None:
                 target_k = tc.get('target_k')
@@ -337,13 +393,14 @@ class CoreNode(Node):
         row = build_measurement_row(
             int(program_id),
             e720,
-            float(control_msg.value),
-            float(monitor_msg.value) if monitor_msg is not None else 0.0,
+            control_value,
+            monitor_value,
             target_k,
             run_id=int(run_id),
             elapsed_s=self.program_manager.elapsed_s(),
             e720_updated_monotonic=self._latest_e720_monotonic,
             e720_max_age_sec=self.measurement_log_e720_max_age_sec,
+            include_ltm=include_ltm,
         )
         try:
             self._measurement_db_queue.put_nowait(row)
@@ -453,7 +510,7 @@ class CoreNode(Node):
         if self.program_manager is None:
             return {
                 'result': 'False',
-                'error': 'Program scheduler not available (enable_pwm_controller and enable_program_scheduler)',
+                'error': 'Program scheduler not available (enable_program_scheduler and database)',
             }
         cmd = str(program_cmd.get('cmd', '')).strip().lower()
         if cmd == 'start':
@@ -461,6 +518,7 @@ class CoreNode(Node):
             out = self.program_manager.start(program_id)
             if str(out.get('result', '')).lower() in ('ok', 'true'):
                 self._reset_program_ltm_watchdog()
+                self._last_measurement_log_monotonic = 0.0
             self._publish_experiment_status(force=True)
             return out
         if cmd == 'stop':

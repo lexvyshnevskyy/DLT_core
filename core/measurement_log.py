@@ -37,6 +37,7 @@ def build_measurement_row(
     elapsed_s: Optional[float] = None,
     e720_updated_monotonic: float = 0.0,
     e720_max_age_sec: float = 1.0,
+    include_ltm: bool = True,
 ) -> Dict[str, Any]:
     freq, measure_ch1, measure_ch2 = e720_measure_values(
         e720,
@@ -48,8 +49,8 @@ def build_measurement_row(
         'freq': freq,
         'measure_ch1': measure_ch1,
         'measure_ch2': measure_ch2,
-        't_ch1': float(control_value),
-        't_ch2': float(monitor_value),
+        't_ch1': float(control_value) if include_ltm else 0.0,
+        't_ch2': float(monitor_value) if include_ltm else 0.0,
         't_exp': float(target_k if target_k is not None else 0.0),
     }
     if run_id is not None and int(run_id) > 0:

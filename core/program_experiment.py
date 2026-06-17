@@ -15,11 +15,32 @@ class ProgramStep:
     minutes: float
 
 
+EXPERIMENT_MODES = ('default', 'measure_only', 'measure_ltm')
+
+
+def normalize_experiment_mode(value: str) -> str:
+    normalized = (value or 'default').strip().lower()
+    return normalized if normalized in EXPERIMENT_MODES else 'default'
+
+
+def uses_temperature_control(mode: str) -> bool:
+    return normalize_experiment_mode(mode) == 'default'
+
+
+def uses_timer_tick(mode: str) -> bool:
+    return normalize_experiment_mode(mode) in ('measure_only', 'measure_ltm')
+
+
+def uses_ltm_in_logs(mode: str) -> bool:
+    return normalize_experiment_mode(mode) in ('default', 'measure_ltm')
+
+
 @dataclass
 class ExperimentState:
     program_id: Optional[int] = None
     run_id: Optional[int] = None
     run_index: Optional[int] = None
+    experiment_mode: str = 'default'
     steps: List[ProgramStep] = field(default_factory=list)
     step_index: int = 0
     step_started_monotonic: Optional[float] = None
@@ -183,6 +204,7 @@ def state_to_public_dict(state: ExperimentState) -> Dict[str, Any]:
         label = f'{state.program_id}.{state.run_index}'
     return {
         'mode': mode,
+        'experiment_mode': normalize_experiment_mode(state.experiment_mode),
         'state': 'running' if state.program_id is not None else 'idle',
         'program_id': state.program_id,
         'run_id': state.run_id,

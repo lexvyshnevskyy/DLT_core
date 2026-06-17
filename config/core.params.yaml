@@ -25,6 +25,7 @@
     experiment_status_publish_period_sec: 0.25
     enable_measurement_logging: true
     measurement_log_e720_max_age_sec: 1.0
+    measurement_log_interval_sec: 1.0
     measurement_timeout_sec: 5.0
     program_ltm_control_timeout_sec: 5.0
     program_ltm_watchdog_period_sec: 0.5

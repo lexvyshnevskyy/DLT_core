@@ -9,9 +9,11 @@ from .program_experiment import (
     ExperimentState,
     ProgramScheduler,
     ProgramStep,
+    normalize_experiment_mode,
     program_elapsed_s,
     state_to_public_dict,
     total_program_duration_s,
+    uses_temperature_control,
 )
 
 if TYPE_CHECKING:
@@ -109,10 +111,19 @@ class ProgramExperimentManager:
         self._state = ExperimentState()
         self._log(f'Program {program_id} start aborted (run {run_id or "—"}): {reason}')
 
+    def _load_experiment_mode(self, program_id: int) -> str:
+        response = self._db_query({'cmd': 'get_program_detail', 'id': program_id})
+        if response.get('result') != 'Ok':
+            return 'default'
+        row = response.get('row') or {}
+        meta = row.get('meta') if isinstance(row.get('meta'), dict) else {}
+        return normalize_experiment_mode(str(meta.get('experiment_mode', 'default')))
+
     def _start_locked(self, program_id_int: int) -> Dict[str, Any]:
         if not self._database_ready():
             return {'result': 'False', 'error': self._database_error()}
-        if not self._temperature_enabled():
+        experiment_mode = self._load_experiment_mode(program_id_int)
+        if uses_temperature_control(experiment_mode) and not self._temperature_enabled():
             return {
                 'result': 'False',
                 'error': 'Temperature control not enabled (enable_pwm_controller:=true)',
@@ -155,6 +166,7 @@ class ProgramExperimentManager:
                 program_id=program_id_int,
                 run_id=run_id,
                 run_index=run_index,
+                experiment_mode=experiment_mode,
                 steps=steps,
                 step_index=0,
                 step_started_monotonic=None,
@@ -163,7 +175,8 @@ class ProgramExperimentManager:
                 last_target_k=first_target_k,
             )
 
-            self._apply_target(first_target_k, reset_integral=True, raise_on_error=True)
+            if uses_temperature_control(experiment_mode):
+                self._apply_target(first_target_k, reset_integral=True, raise_on_error=True)
         except Exception as exc:
             self._abort_failed_start(program_id_int, run_id, str(exc))
             return {'result': 'False', 'error': str(exc)}
@@ -171,7 +184,7 @@ class ProgramExperimentManager:
         total_min = total_program_duration_s(steps) / 60.0
         self._log(
             f'Core started program {program_id_int} run {run_id} '
-            f'({len(steps)} steps, ~{total_min:.1f} min)'
+            f'({len(steps)} steps, ~{total_min:.1f} min, mode={experiment_mode})'
         )
         return {'result': 'Ok', 'program': state_to_public_dict(self._state)}
 
@@ -234,7 +247,8 @@ class ProgramExperimentManager:
             if target_k is None:
                 return
             reset = bool(action.get('step_started') or action.get('reset_integral'))
-            self._apply_target(float(target_k), reset_integral=reset)
+            if uses_temperature_control(self._state.experiment_mode):
+                self._apply_target(float(target_k), reset_integral=reset)
             if action.get('step_started') or action.get('advanced_step'):
                 step = int(action.get('step_index', 0)) + 1
                 total = int(action.get('step_count', 0))
