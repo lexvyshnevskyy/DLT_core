@@ -5,8 +5,9 @@ import time
 from collections import deque
 from typing import Any, Callable, Deque, Dict, Optional, Tuple
 
-# Odd window so the stored sample is the middle value, not an average of two.
-MEASUREMENT_MEDIAN_WINDOW = 5
+# Stored temperature is the median of real samples from this many seconds,
+# not the last few frames. A short glitch then cannot fill the window.
+MEASUREMENT_MEDIAN_WINDOW_S = 5.0
 
 DbQueryFn = Callable[[Dict[str, Any]], Dict[str, Any]]
 
@@ -75,19 +76,32 @@ class MeasurementMedianFilter:
     """Rolling median for logged temperatures.
 
     Control keeps the raw sample. Each database row stores the middle of the
-    last five readings so a single spike is not written.
+    real readings from the last few seconds, so a burst of a few frames is
+    not written.
     """
 
-    def __init__(self, window: int = MEASUREMENT_MEDIAN_WINDOW) -> None:
-        self._window = max(1, int(window))
+    def __init__(self, window_s: float = MEASUREMENT_MEDIAN_WINDOW_S) -> None:
+        self._window_s = max(0.1, float(window_s))
         self._run_id: Optional[int] = None
-        self._channels: Dict[str, Deque[float]] = {}
+        self._channels: Dict[str, Deque[Tuple[float, float]]] = {}
 
     def reset(self) -> None:
         self._run_id = None
         self._channels.clear()
 
-    def apply(self, row: Dict[str, Any]) -> Dict[str, Any]:
+    def _prune(self, buf: Deque[Tuple[float, float]], now: float) -> None:
+        cutoff = float(now) - self._window_s
+        while buf and buf[0][0] < cutoff:
+            buf.popleft()
+
+    @staticmethod
+    def _median(buf: Deque[Tuple[float, float]]) -> float:
+        return float(statistics.median(sample for _stamp, sample in buf))
+
+    def apply(self, row: Dict[str, Any], now: Optional[float] = None) -> Dict[str, Any]:
+        if now is None:
+            now = time.monotonic()
+        now = float(now)
         run_id = row.get('run_id')
         run_key = int(run_id) if run_id is not None else None
         if run_key != self._run_id:
@@ -100,19 +114,23 @@ class MeasurementMedianFilter:
             raw = out.get(key)
             buf = self._channels.get(key)
             if raw is None:
-                # Gap: keep the last median of real samples. Do not append.
+                # Gap: do not append. Repeat the median of samples still inside
+                # the time window.
                 if buf:
-                    out[key] = float(statistics.median(buf))
+                    self._prune(buf, now)
+                if buf:
+                    out[key] = self._median(buf)
                 continue
             try:
                 value = float(raw)
             except (TypeError, ValueError):
                 continue
             if buf is None:
-                buf = deque(maxlen=self._window)
+                buf = deque()
                 self._channels[key] = buf
-            buf.append(value)
-            out[key] = float(statistics.median(buf))
+            buf.append((now, value))
+            self._prune(buf, now)
+            out[key] = self._median(buf)
         return out
 
 
