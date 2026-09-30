@@ -39,7 +39,7 @@ class CoreNode(Node):
         self.declare_parameter('pwm_frequency_hz', 10)
         self.declare_parameter('pwm_range', 1000)
         self.declare_parameter('control_channel', 9)
-        self.declare_parameter('monitor_channel', 3)
+        self.declare_parameter('monitor_channel', 9)
         self.declare_parameter('target_k', 373.15)
         self.declare_parameter('measure_topic', '/measure_device')
         self.declare_parameter('measure_source', 'e720')
@@ -53,10 +53,20 @@ class CoreNode(Node):
         self.declare_parameter('program_ltm_control_timeout_sec', 5.0)
         self.declare_parameter('program_ltm_watchdog_period_sec', 0.5)
         self.declare_parameter('database_query_timeout_sec', 15.0)
-        self.declare_parameter('kp', 25.0)
-        self.declare_parameter('ki', 0.08)
-        self.declare_parameter('deadband_k', 0.3)
-        self.declare_parameter('max_output_step', 60)
+        self.declare_parameter('kp', 40.0)
+        self.declare_parameter('ki', 0.12)
+        self.declare_parameter('deadband_k', 0.2)
+        self.declare_parameter('max_output_step', 80)
+        self.declare_parameter('cooler_min_duty', 200)
+        self.declare_parameter('cooler_max_duty', 1000)
+        self.declare_parameter('agenda_tol_k', 0.2)
+        self.declare_parameter('fuse_enter_k', 5.0)
+        self.declare_parameter('fuse_release_k', 1.0)
+        self.declare_parameter('precondition_stabilize_sec', 120.0)
+        self.declare_parameter('precondition_band_k', 1.0)
+        self.declare_parameter('predict_tau_s', 20.0)
+        self.declare_parameter('settle_rate_k_s', 0.05)
+        self.declare_parameter('settle_hold_sec', 5.0)
 
         self.measurement_topic = str(self.get_parameter('measurement_topic').value)
         self.measure_source = str(self.get_parameter('measure_source').value).strip().lower() or 'e720'
@@ -151,14 +161,19 @@ class CoreNode(Node):
 
         if self.enable_pwm_controller:
             try:
+                pwm_range = int(self.get_parameter('pwm_range').value)
+                cooler_min_duty = int(self.get_parameter('cooler_min_duty').value)
+                cooler_max_duty = int(self.get_parameter('cooler_max_duty').value)
                 self.controller = CoreController(
                     pwm_pin=int(self.get_parameter('pwm_pin').value),
                     pwm_pin_ch2=int(self.get_parameter('pwm_pin_ch2').value),
                     pwm_frequency_hz=int(self.get_parameter('pwm_frequency_hz').value),
-                    pwm_range=int(self.get_parameter('pwm_range').value),
+                    pwm_range=pwm_range,
+                    cooler_min_duty=cooler_min_duty,
+                    cooler_max_duty=cooler_max_duty,
                 )
                 self.temperature_control = TemperatureControlWorker(
-                    set_output_callback=self.controller.set_heater_output,
+                    set_output_callback=self.controller.set_thermal_output,
                     control_channel=self.control_channel,
                     monitor_channel=self.monitor_channel,
                     target_k=float(self.get_parameter('target_k').value),
@@ -170,13 +185,20 @@ class CoreNode(Node):
                     ki=float(self.get_parameter('ki').value),
                     deadband_k=float(self.get_parameter('deadband_k').value),
                     max_output_step=int(self.get_parameter('max_output_step').value),
-                    output_min=0,
-                    output_max=int(self.get_parameter('pwm_range').value),
+                    cooler_min_duty=cooler_min_duty,
+                    cooler_max_duty=cooler_max_duty,
+                    agenda_tol_k=float(self.get_parameter('agenda_tol_k').value),
+                    predict_tau_s=float(self.get_parameter('predict_tau_s').value),
+                    settle_rate_k_s=float(self.get_parameter('settle_rate_k_s').value),
+                    # Bipolar: +heat on CH1, -cool on CH2.
+                    output_min=-pwm_range,
+                    output_max=pwm_range,
                 )
                 self.temperature_control.start()
                 backend = self.controller.heater_pwm.backend
                 self.get_logger().info(
-                    f'PWM controller and threaded temperature control initialized (backend={backend}).'
+                    f'Thermal PWM ready (backend={backend}): CH1 heater / CH2 cooler, '
+                    f'bipolar PI ±{pwm_range}.'
                 )
             except Exception as exc:
                 self.controller = None
@@ -192,6 +214,19 @@ class CoreNode(Node):
                 database_error=self._database_unavailable_reason,
                 temperature_enabled=lambda: self.temperature_control is not None,
                 zero_heaters=self._zero_all_heaters,
+                measure_source=self.measure_source,
+                control_temperature=self._current_control_temperature,
+                temperature_snapshot=self._temperature_control_snapshot,
+                fuse_enter_k=float(self.get_parameter('fuse_enter_k').value),
+                fuse_release_k=float(self.get_parameter('fuse_release_k').value),
+                precondition_stabilize_sec=float(
+                    self.get_parameter('precondition_stabilize_sec').value
+                ),
+                precondition_band_k=float(
+                    self.get_parameter('precondition_band_k').value
+                ),
+                agenda_tol_k=float(self.get_parameter('agenda_tol_k').value),
+                settle_hold_sec=float(self.get_parameter('settle_hold_sec').value),
             )
             self._program_ltm_watchdog_timer = self.create_timer(
                 self.program_ltm_watchdog_period_sec,
@@ -230,6 +265,16 @@ class CoreNode(Node):
         )
 
     def _e720_callback(self, msg: E720) -> None:
+        # Offline placeholder frames are all zeros; refreshing freshness with them
+        # makes measurement_log write zeros instead of holding the last good sample
+        # until measurement_log_e720_max_age_sec expires.
+        frame_id = ''
+        try:
+            frame_id = str(msg.header.frame_id)
+        except Exception:
+            frame_id = ''
+        if frame_id.endswith('_offline'):
+            return
         self._latest_e720 = msg
         self._latest_e720_monotonic = time.monotonic()
 
@@ -243,9 +288,10 @@ class CoreNode(Node):
     def _zero_all_heaters(self) -> None:
         if self.controller is not None:
             try:
-                self.controller.set_heater_output(0)
+                # Experiment stop: heater off and gas cooler truly off.
+                self.controller.set_thermal_output(0, cooler_off=True)
             except Exception as exc:
-                self.get_logger().error(f'Failed to set heater PWM to 0: {exc}')
+                self.get_logger().error(f'Failed to zero heater/cooler PWM: {exc}')
         if self.temperature_control is not None:
             try:
                 self.temperature_control.configure(enabled=False)
@@ -286,28 +332,42 @@ class CoreNode(Node):
             f'No valid LTM sample on control channel {self.control_channel} for '
             f'{self.program_ltm_control_timeout_sec:.1f}s — stopping experiment as FAIL'
         )
-        self._zero_all_heaters()
+        try:
+            self._zero_all_heaters()
+        except Exception as exc:
+            self.get_logger().error(f'LTM FAIL: zero heaters failed: {exc}')
         if self.program_manager is not None and self.program_manager.is_running():
-            self.program_manager.stop(program_id=None, final_status='FAIL')
-        self._publish_experiment_status(force=True)
+            try:
+                self.program_manager.stop(program_id=None, final_status='FAIL')
+            except Exception as exc:
+                # Never let DB/timeouts kill the core node during FAIL handling.
+                self.get_logger().error(f'LTM FAIL: program stop failed: {exc}')
+        try:
+            self._publish_experiment_status(force=True)
+        except Exception as exc:
+            self.get_logger().error(f'LTM FAIL: status publish failed: {exc}')
 
     def _program_ltm_watchdog_tick(self) -> None:
-        if self.program_manager is None or not self.program_manager.is_running():
-            return
-        if not uses_temperature_control(self._current_experiment_mode()):
-            return
-        if self._ltm_fail_in_progress:
-            return
-        last = self._last_control_ltm_monotonic
-        if last <= 0.0:
-            return
-        if (time.monotonic() - last) <= self.program_ltm_control_timeout_sec:
-            return
-        self._ltm_fail_in_progress = True
         try:
-            self._fail_program_ltm_timeout()
-        finally:
+            if self.program_manager is None or not self.program_manager.is_running():
+                return
+            if not uses_temperature_control(self._current_experiment_mode()):
+                return
+            if self._ltm_fail_in_progress:
+                return
+            last = self._last_control_ltm_monotonic
+            if last <= 0.0:
+                return
+            if (time.monotonic() - last) <= self.program_ltm_control_timeout_sec:
+                return
+            self._ltm_fail_in_progress = True
+            try:
+                self._fail_program_ltm_timeout()
+            finally:
+                self._ltm_fail_in_progress = False
+        except Exception as exc:
             self._ltm_fail_in_progress = False
+            self.get_logger().error(f'LTM watchdog tick failed: {exc}')
 
     def measurement_callback(self, msg: Measurement) -> None:
         self.latest_measurements[int(msg.channel)] = msg
@@ -400,7 +460,7 @@ class CoreNode(Node):
             monitor_value,
             target_k,
             run_id=int(run_id),
-            elapsed_s=self.program_manager.elapsed_s(),
+            elapsed_s=self.program_manager.run_elapsed_s(),
             e720_updated_monotonic=self._latest_e720_monotonic,
             e720_max_age_sec=self.measurement_log_e720_max_age_sec,
             include_ltm=include_ltm,
@@ -596,13 +656,66 @@ class CoreNode(Node):
                 'PWM controller is not enabled. Set parameter enable_pwm_controller:=true and ensure GPIO PWM is available (pigpiod on Pi 4, lgpio on Pi 5).'
             )
 
+        pwm_range = int(self.controller.heater_pwm.range)
+
+        def _percent_to_duty(value: Any) -> int:
+            return int(round(max(0.0, min(100.0, float(value))) * pwm_range / 100.0))
+
+        def _raw_to_duty(value: Any) -> int:
+            if pwm.get('unit') == 'percent' or pwm.get('as_percent'):
+                return _percent_to_duty(value)
+            return max(0, min(int(round(float(value))), pwm_range))
+
+        # Independent channels: heater_ch1/ch2 or *_percent (0..100).
+        ch1_pct = pwm.get('heater_ch1_percent', pwm.get('ch1_percent'))
+        ch2_pct = pwm.get('heater_ch2_percent', pwm.get('ch2_percent'))
+        ch1_raw = pwm.get('heater_ch1', pwm.get('ch1'))
+        ch2_raw = pwm.get('heater_ch2', pwm.get('ch2'))
+        if ch1_pct is not None or ch2_pct is not None or ch1_raw is not None or ch2_raw is not None:
+            duty_ch1 = None
+            duty_ch2 = None
+            if ch1_pct is not None:
+                duty_ch1 = _percent_to_duty(ch1_pct)
+            elif ch1_raw is not None:
+                duty_ch1 = _raw_to_duty(ch1_raw)
+            if ch2_pct is not None:
+                duty_ch2 = _percent_to_duty(ch2_pct)
+            elif ch2_raw is not None:
+                duty_ch2 = _raw_to_duty(ch2_raw)
+            self.controller.set_heater_outputs(duty_ch1=duty_ch1, duty_ch2=duty_ch2)
+            return self.controller.snapshot()
+
         heater = pwm.get('heater')
         if heater is None:
             heater = pwm.get('duty_cycle')
         if heater is None:
-            raise RuntimeError('Manual PWM request must contain heater or duty_cycle.')
+            raise RuntimeError(
+                'Manual PWM request must contain heater/duty_cycle, '
+                'or heater_ch1/heater_ch2 (optionally *_percent).'
+            )
         self.controller.set_heater_output(int(heater))
         return self.controller.snapshot()
+
+    def _current_control_temperature(self) -> Optional[float]:
+        """Latest control-channel temperature (K) for the program fuse, or None."""
+        if self.temperature_control is None:
+            return None
+        try:
+            snap = self.temperature_control.get_snapshot()
+        except Exception:
+            return None
+        value = snap.get('latest_control_temp_k')
+        return float(value) if value is not None else None
+
+    def _temperature_control_snapshot(self) -> Dict[str, Any]:
+        """Full thermal snapshot for predictive preheat / settle gating."""
+        if self.temperature_control is None:
+            return {}
+        try:
+            snap = self.temperature_control.get_snapshot()
+        except Exception:
+            return {}
+        return snap if isinstance(snap, dict) else {}
 
     def _apply_temperature_control(self, config: Dict[str, Any]) -> Dict[str, Any]:
         if self.temperature_control is None:
@@ -621,7 +734,18 @@ class CoreNode(Node):
             max_output_step=self._opt_int(config, 'max_output_step'),
             control_period_sec=self._opt_float(config, 'control_period_sec'),
             measurement_timeout_sec=self._opt_float(config, 'measurement_timeout_sec'),
+            actuator_mode=(
+                str(config['actuator_mode']) if 'actuator_mode' in config else None
+            ),
             reset_integral=bool(config.get('reset_integral', False)),
+            seed_cooler_min=bool(config.get('seed_cooler_min', False)),
+            preheat=bool(config.get('preheat', False)),
+            precool=bool(config.get('precool', False)),
+            clear_hold=bool(config.get('clear_hold', False)),
+            handoff_hold=bool(config.get('handoff_hold', False)),
+            stabilize_mode=(
+                bool(config['stabilize_mode']) if 'stabilize_mode' in config else None
+            ),
         )
 
     def _measurement_snapshot(self) -> Dict[str, Dict[str, Any]]:
@@ -703,10 +827,23 @@ def main(args=None) -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        node.shutdown()
-        executor.shutdown()
-        node.destroy_node()
-        rclpy.shutdown()
+        try:
+            node.shutdown()
+        except Exception:
+            pass
+        try:
+            executor.shutdown()
+        except Exception:
+            pass
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
+        try:
+            if rclpy.ok():
+                rclpy.shutdown()
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':

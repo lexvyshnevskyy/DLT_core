@@ -16,7 +16,7 @@
     pwm_range: 1000
 
     control_channel: 9
-    monitor_channel: 3
+    monitor_channel: 9
     measure_topic: /measure_device
     measure_source: e720
     target_k: 373.15
@@ -30,7 +30,20 @@
     program_ltm_control_timeout_sec: 5.0
     program_ltm_watchdog_period_sec: 0.5
 
-    kp: 25.0
-    ki: 0.08
-    deadband_k: 0.3
-    max_output_step: 60
+    kp: 40.0
+    ki: 0.12
+    deadband_k: 0.2
+    max_output_step: 80
+    # Gas cooler CH2 (gpio19): idle/"zero" = cooler_min_duty (20%); cool = up to max.
+    cooler_min_duty: 200
+    cooler_max_duty: 1000
+    agenda_tol_k: 0.2
+    fuse_enter_k: 5.0
+    fuse_release_k: 1.0
+    # Fast preheat/precool until |T−t_exp| ≤ band, then stabilize this long.
+    precondition_band_k: 1.0
+    precondition_stabilize_sec: 120.0
+    # Predictive lead: act on T + predict_tau_s * dT/dt to stay within ±agenda_tol.
+    predict_tau_s: 20.0
+    settle_rate_k_s: 0.05
+    settle_hold_sec: 5.0

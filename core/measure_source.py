@@ -10,6 +10,10 @@ def normalize_measure_source(source: str) -> str:
     return normalized if normalized in MEASURE_SOURCES else 'e720'
 
 
+def measure_device_label(source: str) -> str:
+    return 'IM3536' if normalize_measure_source(source) == 'im3536' else 'E7-20'
+
+
 def resolve_measure_topic(
     source: str,
     *,

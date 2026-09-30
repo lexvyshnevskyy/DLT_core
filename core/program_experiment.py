@@ -35,6 +35,19 @@ def uses_ltm_in_logs(mode: str) -> bool:
     return normalize_experiment_mode(mode) in ('default', 'measure_ltm')
 
 
+def actuator_mode_for_step(step: ProgramStep) -> str:
+    """Always bipolar: track agenda with both heater and cooler.
+
+    Cool-down / heat-up used to force cool_only / heat_only, which zeroed the
+    opposite actuator and caused freefall whenever T overshot the ramp.
+    """
+    return 'bipolar'
+
+
+def is_cooldown_step(step: ProgramStep) -> bool:
+    return float(step.t_stop) < float(step.t_start) - 1e-9
+
+
 @dataclass
 class ExperimentState:
     program_id: Optional[int] = None
@@ -47,6 +60,12 @@ class ExperimentState:
     started_monotonic: Optional[float] = None
     status: str = 'Idle'
     last_target_k: Optional[float] = None
+    # Fuse: drive T to the first step's start temperature before timing begins.
+    preconditioning: bool = False
+    precondition_target_k: Optional[float] = None
+    # Sub-phase of preconditioning: 'preheat' | 'precool' | 'stabilize'
+    precondition_phase: str = ''
+    stabilize_until_monotonic: Optional[float] = None
 
 
 def total_program_duration_s(steps: List[ProgramStep]) -> float:
@@ -147,24 +166,31 @@ class ProgramScheduler:
 
         duration_s = max(0.0, float(step.minutes) * 60.0)
         if elapsed_s >= duration_s:
+            finished_target = float(step.t_stop)
             state.step_index += 1
             state.step_started_monotonic = time.monotonic()
             if state.step_index >= len(state.steps):
+                state.last_target_k = finished_target
                 return {
                     'active': False,
                     'finished': True,
                     'program_id': state.program_id,
-                    'target_k': target_k,
+                    'target_k': finished_target,
                 }
+            prev_step = step
             next_step = state.steps[state.step_index]
+            # Continuous agenda (e.g. 290→270 then 270 hold): keep PI state stable.
+            continuous = abs(float(prev_step.t_stop) - float(next_step.t_start)) <= 0.05
+            state.last_target_k = float(next_step.t_start)
             return {
                 'active': True,
                 'program_id': state.program_id,
                 'target_k': float(next_step.t_start),
-                'reset_integral': True,
+                'reset_integral': not continuous,
                 'advanced_step': True,
                 'step_index': state.step_index,
                 'step_count': len(state.steps),
+                'continuous_transition': continuous,
             }
 
         return {
@@ -202,6 +228,11 @@ def state_to_public_dict(state: ExperimentState) -> Dict[str, Any]:
     label = None
     if state.program_id is not None and state.run_index is not None:
         label = f'{state.program_id}.{state.run_index}'
+    stabilize_remaining_s = None
+    if state.preconditioning and state.precondition_phase == 'stabilize':
+        until = state.stabilize_until_monotonic
+        if until is not None:
+            stabilize_remaining_s = max(0.0, float(until) - time.monotonic())
     return {
         'mode': mode,
         'experiment_mode': normalize_experiment_mode(state.experiment_mode),
@@ -212,5 +243,9 @@ def state_to_public_dict(state: ExperimentState) -> Dict[str, Any]:
         'run_label': label,
         'status': state.status,
         'last_target_k': state.last_target_k,
+        'preconditioning': state.preconditioning,
+        'precondition_target_k': state.precondition_target_k,
+        'precondition_phase': state.precondition_phase,
+        'stabilize_remaining_s': stabilize_remaining_s,
         'timing': timing,
     }
