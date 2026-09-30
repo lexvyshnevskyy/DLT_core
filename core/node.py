@@ -18,7 +18,11 @@ from msgs.msg import E720, Measurement
 from .classes.core_controller import CoreController
 from .classes.temperature_control import TemperatureControlWorker
 from .e720_util import e720_from_msg
-from .measurement_log import build_measurement_row, insert_measurement_immediate
+from .measurement_log import (
+    MeasurementMedianFilter,
+    build_measurement_row,
+    insert_measurement_immediate,
+)
 from .program_experiment import normalize_experiment_mode, uses_ltm_in_logs, uses_temperature_control, uses_timer_tick
 from .program_manager import ProgramExperimentManager
 
@@ -115,6 +119,7 @@ class CoreNode(Node):
         self._measurement_db_stop = threading.Event()
         self._measurement_db_thread: Optional[threading.Thread] = None
         self._throttle_log_times: Dict[str, float] = {}
+        self._measurement_median = MeasurementMedianFilter()
         # Core service callbacks call the database client while handling /core/query.
         # Use a reentrant group so the database client response can be processed
         # while the program-start callback waits for it.
@@ -467,6 +472,7 @@ class CoreNode(Node):
             e720_max_age_sec=self.measurement_log_e720_max_age_sec,
             include_ltm=include_ltm,
         )
+        row = self._measurement_median.apply(row)
         try:
             self._measurement_db_queue.put_nowait(row)
         except queue.Full:
@@ -584,6 +590,7 @@ class CoreNode(Node):
             if str(out.get('result', '')).lower() in ('ok', 'true'):
                 self._reset_program_ltm_watchdog()
                 self._last_measurement_log_monotonic = 0.0
+                self._measurement_median.reset()
             self._publish_experiment_status(force=True)
             return out
         if cmd == 'stop':

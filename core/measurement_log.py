@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import statistics
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from collections import deque
+from typing import Any, Callable, Deque, Dict, Optional, Tuple
+
+# Odd window so the stored sample is the middle value, not an average of two.
+MEASUREMENT_MEDIAN_WINDOW = 5
 
 DbQueryFn = Callable[[Dict[str, Any]], Dict[str, Any]]
 
@@ -58,6 +63,42 @@ def build_measurement_row(
     if elapsed_s is not None:
         row['elapsed_s'] = max(0.0, float(elapsed_s))
     return row
+
+
+class MeasurementMedianFilter:
+    """Rolling median for logged temperatures.
+
+    Control keeps the raw sample. Each database row stores the middle of the
+    last five readings so a single spike is not written.
+    """
+
+    def __init__(self, window: int = MEASUREMENT_MEDIAN_WINDOW) -> None:
+        self._window = max(1, int(window))
+        self._run_id: Optional[int] = None
+        self._channels: Dict[str, Deque[float]] = {}
+
+    def reset(self) -> None:
+        self._run_id = None
+        self._channels.clear()
+
+    def apply(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        run_id = row.get('run_id')
+        run_key = int(run_id) if run_id is not None else None
+        if run_key != self._run_id:
+            self._channels.clear()
+            self._run_id = run_key
+        out = dict(row)
+        for key in ('t_ch1', 't_ch2'):
+            if key not in out:
+                continue
+            try:
+                value = float(out[key])
+            except (TypeError, ValueError):
+                continue
+            buf = self._channels.setdefault(key, deque(maxlen=self._window))
+            buf.append(value)
+            out[key] = float(statistics.median(buf))
+        return out
 
 
 def insert_measurement_immediate(db_query: DbQueryFn, row: Dict[str, Any]) -> bool:
