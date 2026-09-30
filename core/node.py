@@ -320,6 +320,7 @@ class CoreNode(Node):
             was_running = True
             self.program_manager.tick()
             if was_running and not self.program_manager.is_running():
+                self._flush_measurement_bin()
                 self._publish_experiment_status(force=True)
                 return
         except Exception as exc:
@@ -392,6 +393,7 @@ class CoreNode(Node):
                 if was_running and bool(msg.valid):
                     self.program_manager.tick()
                 if was_running and not self.program_manager.is_running():
+                    self._flush_measurement_bin()
                     self._publish_experiment_status(force=True)
             except Exception as exc:
                 self.get_logger().error(f'Program scheduler tick failed: {exc}')
@@ -473,11 +475,19 @@ class CoreNode(Node):
             e720_max_age_sec=self.measurement_log_e720_max_age_sec,
             include_ltm=include_ltm,
         )
-        row = self._measurement_median.apply(row)
+        done = self._measurement_median.add(row)
+        self._enqueue_measurement(done)
+
+    def _enqueue_measurement(self, row: Optional[Dict[str, Any]]) -> None:
+        if not row:
+            return
         try:
             self._measurement_db_queue.put_nowait(row)
         except queue.Full:
             self.get_logger().warning('measurement DB queue full — sample dropped')
+
+    def _flush_measurement_bin(self) -> None:
+        self._enqueue_measurement(self._measurement_median.flush())
 
     def _measurement_db_worker(self) -> None:
         while not self._measurement_db_stop.is_set():
@@ -591,6 +601,7 @@ class CoreNode(Node):
             if str(out.get('result', '')).lower() in ('ok', 'true'):
                 self._reset_program_ltm_watchdog()
                 self._last_measurement_log_monotonic = 0.0
+                self._flush_measurement_bin()
                 self._measurement_median.reset()
             self._publish_experiment_status(force=True)
             return out

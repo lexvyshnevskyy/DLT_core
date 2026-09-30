@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import statistics
 import time
-from collections import deque
-from typing import Any, Callable, Deque, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional
 
-# Stored temperature is the median of real samples from this many seconds,
-# not the last few frames. A short glitch then cannot fill the window.
-MEASUREMENT_MEDIAN_WINDOW_S = 5.0
+# One stored row is the median of every real sample collected in this long.
+MEASUREMENT_BIN_S = 2.0
 
 DbQueryFn = Callable[[Dict[str, Any]], Dict[str, Any]]
 
@@ -72,65 +70,122 @@ def build_measurement_row(
     return row
 
 
-class MeasurementMedianFilter:
-    """Rolling median for logged temperatures.
+def _median(values: List[float]) -> Optional[float]:
+    if not values:
+        return None
+    return float(statistics.median(values))
 
-    Control keeps the raw sample. Each database row stores the middle of the
-    real readings from the last few seconds, so a burst of a few frames is
-    not written.
+
+def _as_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number:
+        return None
+    return number
+
+
+class MeasurementMedianFilter:
+    """Collect every sample for a short bin, then store one median row.
+
+    Control still uses each raw reading. The database receives the middle of
+    the bin, so a few bad frames cannot become the saved value.
     """
 
-    def __init__(self, window_s: float = MEASUREMENT_MEDIAN_WINDOW_S) -> None:
+    def __init__(self, window_s: float = MEASUREMENT_BIN_S) -> None:
         self._window_s = max(0.1, float(window_s))
         self._run_id: Optional[int] = None
-        self._channels: Dict[str, Deque[Tuple[float, float]]] = {}
+        self._opened: Optional[float] = None
+        self._rows: List[Dict[str, Any]] = []
 
     def reset(self) -> None:
         self._run_id = None
-        self._channels.clear()
+        self._opened = None
+        self._rows.clear()
 
-    def _prune(self, buf: Deque[Tuple[float, float]], now: float) -> None:
-        cutoff = float(now) - self._window_s
-        while buf and buf[0][0] < cutoff:
-            buf.popleft()
-
-    @staticmethod
-    def _median(buf: Deque[Tuple[float, float]]) -> float:
-        return float(statistics.median(sample for _stamp, sample in buf))
-
-    def apply(self, row: Dict[str, Any], now: Optional[float] = None) -> Dict[str, Any]:
+    def add(self, row: Dict[str, Any], now: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        """Append one sample. Return the finished bin when 2 s have been collected."""
         if now is None:
             now = time.monotonic()
         now = float(now)
         run_id = row.get('run_id')
         run_key = int(run_id) if run_id is not None else None
         if run_key != self._run_id:
-            self._channels.clear()
+            self._rows.clear()
+            self._opened = None
             self._run_id = run_key
-        out = dict(row)
-        for key in ('t_ch1', 't_ch2'):
-            if key not in out:
+        if self._opened is not None and (now - self._opened) >= self._window_s and self._rows:
+            done = self._summarize()
+            self._rows = [dict(row)]
+            self._opened = now
+            return done
+        if self._opened is None:
+            self._opened = now
+        self._rows.append(dict(row))
+        return None
+
+    def flush(self) -> Optional[Dict[str, Any]]:
+        """Close a short tail bin when the run ends."""
+        if not self._rows:
+            self._opened = None
+            return None
+        done = self._summarize()
+        self._rows.clear()
+        self._opened = None
+        return done
+
+    def _summarize(self) -> Dict[str, Any]:
+        out = dict(self._rows[-1])
+        t_ch1: List[float] = []
+        t_ch2: List[float] = []
+        t_exp: List[float] = []
+        elapsed: List[float] = []
+        freq: List[float] = []
+        measure_ch1: List[float] = []
+        measure_ch2: List[float] = []
+        for sample in self._rows:
+            value = _as_float(sample.get('t_ch1'))
+            if value is not None:
+                t_ch1.append(value)
+            value = _as_float(sample.get('t_ch2'))
+            if value is not None:
+                t_ch2.append(value)
+            value = _as_float(sample.get('t_exp'))
+            if value is not None:
+                t_exp.append(value)
+            value = _as_float(sample.get('elapsed_s'))
+            if value is not None:
+                elapsed.append(value)
+            frequency = _as_float(sample.get('freq')) or 0.0
+            if abs(frequency) < 1e-9:
                 continue
-            raw = out.get(key)
-            buf = self._channels.get(key)
-            if raw is None:
-                # Gap: do not append. Repeat the median of samples still inside
-                # the time window.
-                if buf:
-                    self._prune(buf, now)
-                if buf:
-                    out[key] = self._median(buf)
+            primary = _as_float(sample.get('measure_ch1'))
+            secondary = _as_float(sample.get('measure_ch2'))
+            if primary in (None, 0.0) and secondary in (None, 0.0):
                 continue
-            try:
-                value = float(raw)
-            except (TypeError, ValueError):
-                continue
-            if buf is None:
-                buf = deque()
-                self._channels[key] = buf
-            buf.append((now, value))
-            self._prune(buf, now)
-            out[key] = self._median(buf)
+            freq.append(frequency)
+            if primary not in (None, 0.0):
+                measure_ch1.append(float(primary))
+            if secondary not in (None, 0.0):
+                measure_ch2.append(float(secondary))
+        if t_ch1:
+            out['t_ch1'] = _median(t_ch1)
+        out['t_ch2'] = _median(t_ch2)
+        if t_exp:
+            out['t_exp'] = _median(t_exp)
+        if elapsed:
+            out['elapsed_s'] = _median(elapsed)
+        if freq:
+            out['freq'] = _median(freq)
+            out['measure_ch1'] = _median(measure_ch1) if measure_ch1 else 0.0
+            out['measure_ch2'] = _median(measure_ch2) if measure_ch2 else 0.0
+        else:
+            out['freq'] = 0.0
+            out['measure_ch1'] = 0.0
+            out['measure_ch2'] = 0.0
         return out
 
 
