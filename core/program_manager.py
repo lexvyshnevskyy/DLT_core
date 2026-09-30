@@ -579,7 +579,15 @@ class ProgramExperimentManager:
                 if action.get('finished'):
                     pid = int(action.get('program_id', self._state.program_id or 0))
                     rid = int(self._state.run_id or 0)
-                    self._finish_program(rid, pid, 'Finished')
+                    hold_k = action.get('target_k')
+                    if hold_k is None:
+                        hold_k = self._state.last_target_k
+                    self._finish_program(
+                        rid,
+                        pid,
+                        'Finished',
+                        hold_target_k=hold_k,
+                    )
                 return
 
             target_k = action.get('target_k')
@@ -642,9 +650,27 @@ class ProgramExperimentManager:
             self._log(f'Program {program_id} finish fallback failed: {exc}')
             return False
 
-    def _finish_program(self, run_id: int, program_id: int, final_status: str) -> None:
-        self._zero_heaters()
-        self._halt_temperature_control()
+    def _finish_program(
+        self,
+        run_id: int,
+        program_id: int,
+        final_status: str,
+        *,
+        hold_target_k: Optional[float] = None,
+    ) -> None:
+        # A completed run keeps the last agenda temperature. Stop / FAIL still
+        # drops the outputs. Stabilize or a new program is what moves T next.
+        held_k: Optional[float] = None
+        if str(final_status) == 'Finished' and uses_temperature_control(self._state.experiment_mode):
+            if hold_target_k is None:
+                hold_target_k = self._state.last_target_k
+            if hold_target_k is None and self._state.steps:
+                hold_target_k = float(self._state.steps[-1].t_stop)
+            if hold_target_k is not None and self._hold_finished_temperature(float(hold_target_k)):
+                held_k = float(hold_target_k)
+        if held_k is None:
+            self._zero_heaters()
+            self._halt_temperature_control()
 
         db_ok = self._persist_program_finish(run_id, program_id, final_status)
         if not db_ok:
@@ -663,10 +689,28 @@ class ProgramExperimentManager:
                 self._log(f'CRITICAL: DB reconcile after finish failed for program {program_id}: {exc}')
 
         self._state = ExperimentState()
+        hold_note = f' — holding {held_k:.2f} K' if held_k is not None else ''
         self._log(
-            f'Program {program_id} ended: {final_status}'
+            f'Program {program_id} ended: {final_status}{hold_note}'
             + ('' if db_ok else ' (DB sync required — check program_runs)')
         )
+
+    def _hold_finished_temperature(self, target_k: float) -> bool:
+        """Keep bipolar PI on the last program temperature after a normal finish."""
+        if not self._temperature_enabled():
+            return False
+        try:
+            self._configure_temperature({
+                'enabled': True,
+                'target_k': float(target_k),
+                'actuator_mode': 'bipolar',
+                'stabilize_mode': False,
+                'clear_hold': True,
+            })
+        except Exception as exc:
+            self._log(f'Hold after finish failed: {exc}')
+            return False
+        return True
 
     def _apply_target(
         self,
