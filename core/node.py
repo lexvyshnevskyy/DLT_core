@@ -443,9 +443,10 @@ class CoreNode(Node):
             if monitor_msg is None or not bool(monitor_msg.valid):
                 self._log_throttled(
                     'measurement_monitor',
-                    f'Monitor channel {self.monitor_channel} missing or invalid — logging t_ch2=0',
+                    f'Monitor channel {self.monitor_channel} missing or invalid — '
+                    't_ch2 keeps the last valid median',
                 )
-                monitor_value = 0.0
+                monitor_value = None
             else:
                 monitor_value = float(monitor_msg.value)
             control_value = float(control_msg.value)

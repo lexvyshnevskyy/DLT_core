@@ -35,7 +35,7 @@ def build_measurement_row(
     program_id: int,
     e720: Dict[str, Any],
     control_value: float,
-    monitor_value: float,
+    monitor_value: Optional[float],
     target_k: Optional[float],
     *,
     run_id: Optional[int] = None,
@@ -55,7 +55,13 @@ def build_measurement_row(
         'measure_ch1': measure_ch1,
         'measure_ch2': measure_ch2,
         't_ch1': float(control_value) if include_ltm else 0.0,
-        't_ch2': float(monitor_value) if include_ltm else 0.0,
+        # None means "no monitor sample". Do not substitute 0 K — that is a
+        # real temperature and would enter the median window.
+        't_ch2': (
+            float(monitor_value)
+            if include_ltm and monitor_value is not None
+            else (None if include_ltm else 0.0)
+        ),
         't_exp': float(target_k if target_k is not None else 0.0),
     }
     if run_id is not None and int(run_id) > 0:
@@ -91,11 +97,20 @@ class MeasurementMedianFilter:
         for key in ('t_ch1', 't_ch2'):
             if key not in out:
                 continue
+            raw = out.get(key)
+            buf = self._channels.get(key)
+            if raw is None:
+                # Gap: keep the last median of real samples. Do not append.
+                if buf:
+                    out[key] = float(statistics.median(buf))
+                continue
             try:
-                value = float(out[key])
+                value = float(raw)
             except (TypeError, ValueError):
                 continue
-            buf = self._channels.setdefault(key, deque(maxlen=self._window))
+            if buf is None:
+                buf = deque(maxlen=self._window)
+                self._channels[key] = buf
             buf.append(value)
             out[key] = float(statistics.median(buf))
         return out
