@@ -16,7 +16,8 @@
     pwm_range: 1000
 
     control_channel: 9
-    monitor_channel: 9
+    # t_ch2. Must stay a different LTM sensor from control_channel (t_ch1).
+    monitor_channel: 3
     measure_topic: /measure_device
     measure_source: e720
     target_k: 373.15

@@ -23,7 +23,7 @@ class ControlSnapshot:
     enabled: bool = False
     target_k: float = 373.15
     control_channel: int = 9
-    monitor_channel: int = 9
+    monitor_channel: int = 3
     latest_control_temp_k: Optional[float] = None
     latest_monitor_temp_k: Optional[float] = None
     # Split-range outputs: never heat and cool at the same time.
@@ -241,7 +241,7 @@ class TemperatureControlWorker:
         set_output_callback: Callable[..., None],
         *,
         control_channel: int = 9,
-        monitor_channel: int = 9,
+        monitor_channel: int = 3,
         target_k: float = 373.15,
         control_period_sec: float = 1.0,
         control_watchdog_period_sec: float = 0.25,

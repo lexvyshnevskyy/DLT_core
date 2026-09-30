@@ -39,7 +39,7 @@ class CoreNode(Node):
         self.declare_parameter('pwm_frequency_hz', 10)
         self.declare_parameter('pwm_range', 1000)
         self.declare_parameter('control_channel', 9)
-        self.declare_parameter('monitor_channel', 9)
+        self.declare_parameter('monitor_channel', 3)
         self.declare_parameter('target_k', 373.15)
         self.declare_parameter('measure_topic', '/measure_device')
         self.declare_parameter('measure_source', 'e720')
@@ -440,8 +440,10 @@ class CoreNode(Node):
                     'measurement_monitor',
                     f'Monitor channel {self.monitor_channel} missing or invalid — logging t_ch2=0',
                 )
+                monitor_value = 0.0
+            else:
+                monitor_value = float(monitor_msg.value)
             control_value = float(control_msg.value)
-            monitor_value = float(monitor_msg.value) if monitor_msg is not None else 0.0
         else:
             control_value = 0.0
             monitor_value = 0.0
