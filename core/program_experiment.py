@@ -228,6 +228,11 @@ def state_to_public_dict(state: ExperimentState) -> Dict[str, Any]:
     label = None
     if state.program_id is not None and state.run_index is not None:
         label = f'{state.program_id}.{state.run_index}'
+    step_temps = [
+        float(value)
+        for step in state.steps
+        for value in (step.t_start, step.t_stop)
+    ]
     stabilize_remaining_s = None
     if state.preconditioning and state.precondition_phase == 'stabilize':
         until = state.stabilize_until_monotonic
@@ -248,4 +253,6 @@ def state_to_public_dict(state: ExperimentState) -> Dict[str, Any]:
         'precondition_phase': state.precondition_phase,
         'stabilize_remaining_s': stabilize_remaining_s,
         'timing': timing,
+        'chart_t_min_k': (min(step_temps) - 20.0) if step_temps else None,
+        'chart_t_max_k': (max(step_temps) + 20.0) if step_temps else None,
     }
